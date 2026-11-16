@@ -15,6 +15,8 @@ models/
 *.pt
 *.pth
 outputs/
+plots/
+*.png
 submissions/
 runs/
 wandb/
