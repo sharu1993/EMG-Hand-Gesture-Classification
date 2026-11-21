@@ -17,11 +17,26 @@ and PyTorch must not share a process on macOS (OpenMP clash).
 from __future__ import annotations
 
 import os
+import sys
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")  # see the note in scripts/train_tcn.py
 
+# --model tcn on macOS: PyTorch's OpenMP runtime must load before NumPy/SciPy's
+# (as in train_tcn.py), and inference runs single-threaded so that neither
+# runtime starts a thread pool ("OMP: Error #179 pthread_mutex_init failed").
+# 348 short actions take a second or two on one thread.
+_TCN = "tcn" in sys.argv[sys.argv.index("--model") + 1:][:1] if "--model" in sys.argv else \
+    any(a == "--model=tcn" for a in sys.argv)
+if _TCN:
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    import torch  # noqa: F401  (load first)
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
 import argparse
-import sys
 import time
 from pathlib import Path
 
