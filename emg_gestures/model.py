@@ -1,5 +1,9 @@
 """Dual-branch causal TCN for Aura gesture windows (PyTorch).
 
+Two input representations share this network: the preprocessed signal
+(``RAW_CONFIG``, below) and short-time feature frames (``FRAME_CONFIG``, see
+emg_gestures/frames.py).
+
     EMG (B, T, 8) -> stem conv -> 5 causal TCN blocks, dilations 1..16 --+
                                                                           +-> concat
     IMU (B, T, 6) -> stem conv -> 3 causal TCN blocks, dilations 1..4  --+
@@ -82,28 +86,67 @@ class Branch(nn.Module):
         super().__init__()
         self.stem = nn.Conv1d(c_in, width, k)
         self.k = k
+        self.dilations = tuple(dilations)
         self.blocks = nn.Sequential(*[TCNBlock(width, k, d, dropout) for d in dilations])
 
     def forward(self, x):  # x: (B, C, T)
         return self.blocks(self.stem(F.pad(x, (self.k - 1, 0))))
 
+    @property
+    def receptive_field(self) -> int:
+        """In input steps (samples for raw input, frames for frame input)."""
+        return 1 + (self.k - 1) + 2 * (self.k - 1) * sum(self.dilations)
+
+
+class GradReverse(torch.autograd.Function):
+    """Identity forward; gradient multiplied by -lambda backward (DANN)."""
+
+    @staticmethod
+    def forward(ctx, x, lam):
+        ctx.lam = lam
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        return -ctx.lam * g, None
+
+
+# Two input representations, same network family.
+RAW_CONFIG = dict(emg_in=8, imu_in=6, emg_width=32, imu_width=16, k=5,
+                  emg_dilations=(1, 2, 4, 8, 16), imu_dilations=(1, 2, 4))
+FRAME_CONFIG = dict(emg_in=52, imu_in=12, emg_width=48, imu_width=16, k=3,
+                    emg_dilations=(1, 2, 4), imu_dilations=(1, 2))  # RF 29 frames ~1.4 s
+
 
 class AuraTCN(nn.Module):
-    def __init__(self, n_classes: int = 6, emg_width: int = 32, imu_width: int = 16,
-                 k: int = 5, dropout: float = 0.15, use_imu: bool = True):
+    """Dual-branch causal TCN with masked attention pooling.
+
+    ``n_domains`` > 0 adds a domain classifier behind a gradient-reversal layer
+    (domain-adversarial training): the shared embedding is pushed to carry no
+    information about the recording setup or session, only about the gesture.
+    """
+
+    def __init__(self, n_classes: int = 6, emg_in: int = 8, imu_in: int = 6,
+                 emg_width: int = 32, imu_width: int = 16, k: int = 5,
+                 emg_dilations=(1, 2, 4, 8, 16), imu_dilations=(1, 2, 4),
+                 dropout: float = 0.15, use_imu: bool = True, n_domains: int = 0):
         super().__init__()
         self.use_imu = use_imu
-        self.emg = Branch(8, emg_width, (1, 2, 4, 8, 16), k, dropout)
+        self.emg = Branch(emg_in, emg_width, emg_dilations, k, dropout)
         width = emg_width
         if use_imu:
-            self.imu = Branch(6, imu_width, (1, 2, 4), k, dropout)
+            self.imu = Branch(imu_in, imu_width, imu_dilations, k, dropout)
             width += imu_width
         self.attn = nn.Conv1d(width, 1, 1)
         self.head = nn.Sequential(nn.Linear(2 * width, 32), nn.GELU(), nn.Dropout(dropout),
                                   nn.Linear(32, n_classes))
+        self.domain_head = None
+        if n_domains > 0:
+            self.domain_head = nn.Sequential(nn.Linear(2 * width, 32), nn.GELU(),
+                                             nn.Linear(32, n_domains))
 
-    def forward(self, emg, imu, mask):
-        """emg (B, T, 8), imu (B, T, 6), mask (B, T) bool -> logits (B, n_classes)."""
+    def embed(self, emg, imu, mask):
+        """emg (B, T, Ce), imu (B, T, Ci), mask (B, T) bool -> pooled (B, 2*width)."""
         h = self.emg(emg.transpose(1, 2))
         if self.use_imu:
             h = torch.cat([h, self.imu(imu.transpose(1, 2))], dim=1)
@@ -111,13 +154,19 @@ class AuraTCN(nn.Module):
         w = torch.softmax(score, dim=1).unsqueeze(1)                     # (B, 1, T)
         m = mask.unsqueeze(1).float()
         mean = (h * m).sum(2) / m.sum(2).clamp(min=1)
-        pooled = torch.cat([(h * w).sum(2), mean], dim=1)                # attention + mean
-        return self.head(pooled)
+        return torch.cat([(h * w).sum(2), mean], dim=1)                  # attention + mean
+
+    def forward(self, emg, imu, mask):
+        """-> class logits (B, n_classes)."""
+        return self.head(self.embed(emg, imu, mask))
+
+    def forward_with_domain(self, emg, imu, mask, lam: float):
+        z = self.embed(emg, imu, mask)
+        return self.head(z), self.domain_head(GradReverse.apply(z, lam))
 
     @property
     def receptive_field(self) -> int:
-        k = self.emg.k
-        return 1 + (k - 1) + 2 * (k - 1) * sum((1, 2, 4, 8, 16))
+        return self.emg.receptive_field
 
 
 def count_parameters(model: nn.Module) -> int:
