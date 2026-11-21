@@ -21,6 +21,8 @@ Feature groups (names are prefixed so they can be selected or ablated):
                 subject-dependent, excluded unless asked for)
     imu_*       per-axis std, peak-to-peak and mean |diff| of accel and gyro,
                 gyro magnitude stats
+    emg_riem*   (riemann=True) multi-band covariance in the tangent space,
+                see emg_gestures/riemann.py
 """
 from __future__ import annotations
 
@@ -28,6 +30,9 @@ from functools import lru_cache
 
 import numpy as np
 from scipy.signal import butter, iirnotch, sosfiltfilt, tf2sos
+
+from .riemann import feature_names as riemann_feature_names
+from .riemann import riemann_window
 
 N_CH = 8
 BANDS = [(20, 45), (55, 95), (105, 125)]
@@ -110,6 +115,17 @@ def imu_features(imu: np.ndarray) -> dict[str, float]:
     return out
 
 
+def riemann_features(emg: np.ndarray, fs: float = 250.0) -> dict[str, float]:
+    """Multi-band covariance tangent vectors (emg_gestures/riemann.py) of the
+    filtered, gain-normalised window: emg_riem<band>_<i>_<j>, 108 values."""
+    y = filter_emg(emg, fs)
+    y = y / (np.sqrt((y ** 2).mean()) + 1e-9)
+    return dict(zip(riemann_feature_names(), riemann_window(y, fs).tolist()))
+
+
 def window_features(emg: np.ndarray, imu: np.ndarray, fs: float = 250.0,
-                    car: bool = False) -> dict[str, float]:
-    return {**emg_features(emg, fs, car), **imu_features(imu)}
+                    car: bool = False, riemann: bool = False) -> dict[str, float]:
+    out = {**emg_features(emg, fs, car), **imu_features(imu)}
+    if riemann:
+        out.update(riemann_features(emg, fs))
+    return out

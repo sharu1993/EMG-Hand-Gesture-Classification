@@ -52,8 +52,18 @@ NO_TRIM = {"trim_start": 0.0, "trim_end": 0.0, "rest_trim_start": 0.0, "rest_tri
 IMU_LOWPASS_HZ = 10.0  # below the slower IMU setup's Nyquist (~22 Hz)
 
 
-def usable_span(label: str, t_start: float, t_end: float, trims: dict) -> tuple[float, float]:
+# Use per-segment steady spans from emg_gestures.align.align_segments instead of
+# fixed trims (the segments need steady_start / steady_end columns).
+ALIGNED = {"aligned": True}
+
+
+def usable_span(label: str, t_start: float, t_end: float, trims: dict,
+                row=None) -> tuple[float, float]:
     """The part of a segment that windows may be cut from, after trimming."""
+    if trims.get("aligned"):
+        if row is None or not hasattr(row, "steady_start"):
+            raise ValueError("ALIGNED trims need segments from emg_gestures.align.align_segments")
+        return row.steady_start, row.steady_end
     if label == "rest":
         return t_start + trims["rest_trim_start"], t_end - trims["rest_trim_end"]
     return t_start + trims["trim_start"], t_end - trims["trim_end"]
@@ -136,7 +146,8 @@ class WindowSampler:
     fs : output sample rate (Hz).
     trims : seconds removed from segment ends before sampling; ``STEADY_STATE``
         (default) excludes the movements between gestures, ``NO_TRIM`` uses the
-        label boundaries as given.
+        label boundaries as given, ``ALIGNED`` uses each segment's own steady
+        span found by emg_gestures.align.align_segments.
     balance : pick classes uniformly (True) or segments uniformly (False).
 
     ``n_fallback`` counts draws where no segment of the chosen class could hold
@@ -157,7 +168,7 @@ class WindowSampler:
 
         usable = []
         for r in segments.itertuples(index=False):
-            lo, hi = usable_span(r.label, r.t_start, r.t_end, trims)
+            lo, hi = usable_span(r.label, r.t_start, r.t_end, trims, r)
             if hi - lo >= min_len:
                 usable.append((r, lo, hi))
         if not usable:
@@ -202,7 +213,7 @@ def fixed_windows(segments: pd.DataFrame, length: float = 1.2, stride: float = 0
     than ``length`` yield no window."""
     out = []
     for r in segments.itertuples(index=False):
-        lo, hi = usable_span(r.label, r.t_start, r.t_end, trims)
+        lo, hi = usable_span(r.label, r.t_start, r.t_end, trims, r)
         t0 = lo
         while t0 + length <= hi + 1e-9:
             emg, imu, n_raw = make_window(r.t, r.emg, r.imu, r.imu_new, t0, length, fs)

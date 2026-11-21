@@ -21,7 +21,8 @@ from sklearn.model_selection import GroupKFold, cross_val_predict
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from emg_gestures.segments import load_segments  # noqa: E402
-from emg_gestures.windows import WindowSampler  # noqa: E402
+from emg_gestures.align import align_segments  # noqa: E402
+from emg_gestures.windows import ALIGNED, STEADY_STATE, WindowSampler  # noqa: E402
 
 
 def grouped_macro_f1(X: np.ndarray, y: np.ndarray, groups: np.ndarray) -> float:
@@ -43,6 +44,8 @@ def main() -> None:
     ap.add_argument("--n-windows", type=int, default=12000)
     ap.add_argument("--min-len", type=float, default=0.75)
     ap.add_argument("--max-len", type=float, default=1.2)
+    ap.add_argument("--align", action="store_true",
+                    help="sample windows from per-segment aligned spans (emg_gestures.align)")
     args = ap.parse_args()
 
     segs = load_segments(args.segments)
@@ -58,7 +61,10 @@ def main() -> None:
     #    length is the one timing feature it can use; it must sit at chance.
     #    Raw row count/rate and offset are not visible to the model; they are
     #    reported as diagnostics.
-    sampler = WindowSampler(segs, args.min_len, args.max_len, seed=0)
+    if args.align:
+        segs = align_segments(segs)
+    sampler = WindowSampler(segs, args.min_len, args.max_len,
+                            trims=ALIGNED if args.align else STEADY_STATE, seed=0)
     ws = sampler.sample_many(args.n_windows)
     y = np.array([w.label for w in ws])
     g = np.array([w.session for w in ws])

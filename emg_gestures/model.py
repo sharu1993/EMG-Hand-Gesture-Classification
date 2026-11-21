@@ -1,8 +1,9 @@
 """Dual-branch causal TCN for Aura gesture windows (PyTorch).
 
-Two input representations share this network: the preprocessed signal
-(``RAW_CONFIG``, below) and short-time feature frames (``FRAME_CONFIG``, see
-emg_gestures/frames.py).
+Three input representations share this network: the preprocessed signal
+(``RAW_CONFIG``, below), short-time feature frames (``FRAME_CONFIG``, see
+emg_gestures/frames.py) and multi-band Riemannian covariance frames
+(``RIEMANN_CONFIG``, see emg_gestures/riemann.py).
 
     EMG (B, T, 8) -> stem conv -> 5 causal TCN blocks, dilations 1..16 --+
                                                                           +-> concat
@@ -115,7 +116,9 @@ class GradReverse(torch.autograd.Function):
 RAW_CONFIG = dict(emg_in=8, imu_in=6, emg_width=32, imu_width=16, k=5,
                   emg_dilations=(1, 2, 4, 8, 16), imu_dilations=(1, 2, 4))
 FRAME_CONFIG = dict(emg_in=52, imu_in=12, emg_width=48, imu_width=16, k=3,
-                    emg_dilations=(1, 2, 4), imu_dilations=(1, 2))  # RF 29 frames ~1.4 s
+                    emg_dilations=(1, 2, 4), imu_dilations=(1, 2))  # RF 31 frames ~1.5 s
+# Riemannian frames (emg_gestures/riemann.py): 3 bands x 36 tangent values per frame.
+RIEMANN_CONFIG = dict(FRAME_CONFIG, emg_in=108)
 
 
 class AuraTCN(nn.Module):
