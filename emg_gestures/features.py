@@ -1,0 +1,115 @@
+"""Hand-crafted EMG/IMU features for one window (baseline models).
+
+Input is a window from ``emg_gestures.windows`` (resampled to ``fs``, mean-
+centred). Every feature is a rate, a ratio or a log-power, so none of them
+scales with the window length.
+
+EMG preprocessing (per window, identical for train, test and live use):
+    high-pass 20 Hz, notches at 50/60/100/120 Hz (mains differs by site),
+    optional common-average reference, then one gain for all channels
+    (window RMS over all channels) so that the cross-channel pattern survives
+    but the per-person/per-session amplitude does not.
+
+Feature groups (names are prefixed so they can be selected or ablated):
+    emg_rel_*   per-channel log RMS relative to the window's mean log RMS
+    emg_wl_*    waveform length per sample (gain-normalised)
+    emg_zc_*    zero-crossing rate, emg_ssc_* slope-sign-change rate
+    emg_bp*_*   relative log band power: 20-45, 55-95, 105-125 Hz
+    emg_hj*_*   Hjorth mobility and complexity
+    emg_corr_*  cross-channel correlations (28 pairs)
+    emg_gain    window log RMS over all channels (absolute amplitude:
+                subject-dependent, excluded unless asked for)
+    imu_*       per-axis std, peak-to-peak and mean |diff| of accel and gyro,
+                gyro magnitude stats
+"""
+from __future__ import annotations
+
+from functools import lru_cache
+
+import numpy as np
+from scipy.signal import butter, iirnotch, sosfiltfilt, tf2sos
+
+N_CH = 8
+BANDS = [(20, 45), (55, 95), (105, 125)]
+IMU_AXES = ["ax", "ay", "az", "gx", "gy", "gz"]
+
+
+@lru_cache(maxsize=8)
+def _filters(fs: float):
+    sos = [butter(4, 20, btype="high", fs=fs, output="sos")]
+    for f0 in (50, 60, 100, 120):
+        if f0 < fs / 2 - 1:
+            sos.append(tf2sos(*iirnotch(f0, Q=30, fs=fs)))
+    return np.vstack(sos)
+
+
+def filter_emg(emg: np.ndarray, fs: float = 250.0, car: bool = False) -> np.ndarray:
+    """High-pass + mains notches (zero-phase within the window); optional CAR."""
+    y = sosfiltfilt(_filters(fs), emg, axis=0, padtype="even")
+    if car:
+        y = y - y.mean(axis=1, keepdims=True)
+    return y
+
+
+def _band_power(y: np.ndarray, fs: float) -> np.ndarray:
+    spec = np.abs(np.fft.rfft(y * np.hanning(len(y))[:, None], axis=0)) ** 2
+    f = np.fft.rfftfreq(len(y), 1 / fs)
+    return np.stack([spec[(f >= lo) & (f < hi)].sum(axis=0) for lo, hi in BANDS])  # (3, ch)
+
+
+def emg_features(emg: np.ndarray, fs: float = 250.0, car: bool = False) -> dict[str, float]:
+    y = filter_emg(emg, fs, car)
+    eps = 1e-9
+    rms = np.sqrt((y ** 2).mean(axis=0)) + eps
+    gain = np.sqrt((rms ** 2).mean())
+    z = y / gain                                   # one gain for all channels
+    log_rms = np.log(rms)
+    out = {"emg_gain": float(np.log(gain))}
+
+    dz = np.diff(z, axis=0)
+    ddz = np.diff(dz, axis=0)
+    thr = 0.05                                      # in window-gain units
+    zc = ((z[:-1] * z[1:] < 0) & (np.abs(z[:-1] - z[1:]) > thr)).mean(axis=0)
+    ssc = ((dz[:-1] * dz[1:] < 0) & (np.maximum(np.abs(dz[:-1]), np.abs(dz[1:])) > thr)).mean(axis=0)
+    wl = np.abs(dz).mean(axis=0)
+    var0, var1, var2 = z.var(axis=0) + eps, dz.var(axis=0) + eps, ddz.var(axis=0) + eps
+    mob = np.sqrt(var1 / var0)
+    comp = np.sqrt(var2 / var1) / mob
+    bp = np.log(_band_power(y, fs) + eps)
+    bp = bp - np.log((rms ** 2) * len(y) + eps)[None, :]   # relative to channel power
+
+    for c in range(N_CH):
+        k = c + 1
+        out[f"emg_rel_{k}"] = float(log_rms[c] - log_rms.mean())
+        out[f"emg_wl_{k}"] = float(wl[c])
+        out[f"emg_zc_{k}"] = float(zc[c])
+        out[f"emg_ssc_{k}"] = float(ssc[c])
+        out[f"emg_hjm_{k}"] = float(mob[c])
+        out[f"emg_hjc_{k}"] = float(comp[c])
+        for b, (lo, hi) in enumerate(BANDS):
+            out[f"emg_bp{lo}_{hi}_{k}"] = float(bp[b, c])
+    corr = np.corrcoef(y.T)
+    iu = np.triu_indices(N_CH, 1)
+    for i, j, v in zip(iu[0], iu[1], corr[iu]):
+        out[f"emg_corr_{i + 1}_{j + 1}"] = float(v)
+    return out
+
+
+def imu_features(imu: np.ndarray) -> dict[str, float]:
+    out = {}
+    d = np.abs(np.diff(imu, axis=0)).mean(axis=0)
+    for a, name in enumerate(IMU_AXES):
+        out[f"imu_std_{name}"] = float(imu[:, a].std())
+        out[f"imu_ptp_{name}"] = float(np.ptp(imu[:, a]))
+        out[f"imu_dmean_{name}"] = float(d[a])
+    gmag = np.linalg.norm(imu[:, 3:6], axis=1)
+    out["imu_gyro_mag_mean"] = float(gmag.mean())
+    out["imu_gyro_mag_max"] = float(gmag.max())
+    amag = np.linalg.norm(imu[:, 0:3], axis=1)
+    out["imu_acc_mag_std"] = float(amag.std())
+    return out
+
+
+def window_features(emg: np.ndarray, imu: np.ndarray, fs: float = 250.0,
+                    car: bool = False) -> dict[str, float]:
+    return {**emg_features(emg, fs, car), **imu_features(imu)}

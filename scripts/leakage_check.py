@@ -42,7 +42,7 @@ def main() -> None:
     ap.add_argument("segments", type=Path)
     ap.add_argument("--n-windows", type=int, default=12000)
     ap.add_argument("--min-len", type=float, default=0.75)
-    ap.add_argument("--max-len", type=float, default=1.4)
+    ap.add_argument("--max-len", type=float, default=1.2)
     args = ap.parse_args()
 
     segs = load_segments(args.segments)
@@ -71,7 +71,8 @@ def main() -> None:
         rows.append((name, len(y), grouped_macro_f1(np.array(X), y, g), chance_f1(y)))
 
     out = pd.DataFrame(rows, columns=["setup", "n", "macro_F1_from_timing", "chance"]).round(3)
-    print(f"segments skipped (shorter than {args.min_len} s): {sampler.dropped}")
+    print(f"segments skipped (steady span shorter than {args.min_len} s): {sampler.dropped}; "
+          f"length fallbacks: {sampler.n_fallback}")
     print(out.to_string(index=False))
 
 

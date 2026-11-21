@@ -2,7 +2,7 @@
 
 Whole segments leak their length (gestures ~3 s, rest ~1.3 s) and the device's
 bursty row rate, so the model never sees them directly. Instead every sample is
-a window of random length cut at a random position inside a labelled segment,
+a window of random length cut at a random position inside the steady part of a labelled segment,
 resampled onto an even time grid and mean-centred per channel, matching the
 test-set format:
 
@@ -15,7 +15,14 @@ test-set format:
     4. subtract each channel's mean over the window
 
 Every class therefore produces windows from the same length distribution, so
-length carries no information about the label. Batches mix lengths; ``pad_batch``
+length carries no information about the label.
+
+Transitions are excluded by default. Movement into a gesture starts ~0.3 s after
+the label begins and settles by ~1.2 s; the release starts ~0.3 s before the
+label ends and carries ~0.3 s into the following rest (gyro/EMG profiles across
+all 28 sessions). ``STEADY_STATE`` trims those parts, so the model learns the
+held posture rather than the movement between gestures. The steady part of a
+gesture is ~1.4 s and of a rest ~1.25 s, hence the 1.2 s maximum length. Batches mix lengths; ``pad_batch``
 returns a mask so a model can pool over real samples only.
 
     from emg_gestures.segments import load_segments
@@ -29,13 +36,32 @@ returns a mask so a model can pool over real samples only.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 import pandas as pd
+from scipy.signal import butter, sosfiltfilt
 
 from .segments import LABELS
 
 LABEL_TO_ID = {lab: i for i, lab in enumerate(LABELS)}
+
+# Seconds removed from each segment end before windows are cut (see module doc).
+STEADY_STATE = {"trim_start": 1.2, "trim_end": 0.4, "rest_trim_start": 0.3, "rest_trim_end": 0.0}
+NO_TRIM = {"trim_start": 0.0, "trim_end": 0.0, "rest_trim_start": 0.0, "rest_trim_end": 0.0}
+IMU_LOWPASS_HZ = 10.0  # below the slower IMU setup's Nyquist (~22 Hz)
+
+
+def usable_span(label: str, t_start: float, t_end: float, trims: dict) -> tuple[float, float]:
+    """The part of a segment that windows may be cut from, after trimming."""
+    if label == "rest":
+        return t_start + trims["rest_trim_start"], t_end - trims["rest_trim_end"]
+    return t_start + trims["trim_start"], t_end - trims["trim_end"]
+
+
+@lru_cache(maxsize=4)
+def _imu_lowpass(fs: float, cutoff: float):
+    return butter(4, cutoff, btype="low", fs=fs, output="sos")
 
 
 @dataclass
@@ -46,7 +72,7 @@ class Window:
     sample_id: str         # source segment
     session: int
     length_s: float        # window length in seconds
-    offset_s: float        # start relative to the segment start (after trimming)
+    offset_s: float        # start relative to the start of the trimmed span
     n_rows_raw: int        # rows in the raw window, kept only for leakage checks
 
 
@@ -71,8 +97,13 @@ def resample(t: np.ndarray, x: np.ndarray, t0: float, n: int, fs: float) -> np.n
     return np.column_stack([np.interp(grid, t, x[:, j]) for j in range(x.shape[1])])
 
 
-def make_window(t, emg, imu, imu_new, t0, length_s, fs=250.0):
-    """Cut [t0, t0 + length_s) from one segment's raw arrays and normalise it."""
+def make_window(t, emg, imu, imu_new, t0, length_s, fs=250.0, imu_lowpass=IMU_LOWPASS_HZ):
+    """Cut [t0, t0 + length_s) from one segment's raw arrays and normalise it.
+
+    The IMU is low-passed at ``imu_lowpass`` Hz after resampling. The two
+    recording setups update the IMU at ~95 Hz and ~45 Hz; without a common
+    bandwidth, IMU roughness identifies the setup instead of the gesture.
+    """
     rows = np.flatnonzero((t >= t0) & (t < t0 + length_s))
     if len(rows) < 2:
         raise ValueError("window contains fewer than two rows")
@@ -86,6 +117,9 @@ def make_window(t, emg, imu, imu_new, t0, length_s, fs=250.0):
         imu_w = resample(tr[np.isin(rows, fresh)], imu[fresh], tr[0], n, fs)
     else:
         imu_w = np.repeat(imu[rows[:1]], n, axis=0)
+    if imu_lowpass:
+        imu_w = sosfiltfilt(_imu_lowpass(fs, imu_lowpass), imu_w, axis=0,
+                            padtype="even", padlen=min(n - 1, 27))
     emg_w -= emg_w.mean(axis=0)
     imu_w -= imu_w.mean(axis=0)
     return emg_w, imu_w, len(rows)
@@ -100,27 +134,30 @@ class WindowSampler:
         first; never sample validation sessions here).
     min_len, max_len : window length range in seconds.
     fs : output sample rate (Hz).
-    trim_start, trim_end : seconds dropped from each end of gesture segments
-        before sampling (the labels can lead the EMG by ~0.5 s). Rest segments
-        are not trimmed. Defaults to 0 = use the label boundaries as given.
+    trims : seconds removed from segment ends before sampling; ``STEADY_STATE``
+        (default) excludes the movements between gestures, ``NO_TRIM`` uses the
+        label boundaries as given.
     balance : pick classes uniformly (True) or segments uniformly (False).
+
+    ``n_fallback`` counts draws where no segment of the chosen class could hold
+    the drawn length (the length was then shortened, which leaks length); it
+    should stay at 0. Keep ``max_len`` at or below the shortest class's span.
     """
 
-    def __init__(self, segments: pd.DataFrame, min_len: float = 0.75, max_len: float = 1.4,
-                 fs: float = 250.0, trim_start: float = 0.0, trim_end: float = 0.0,
+    def __init__(self, segments: pd.DataFrame, min_len: float = 0.75, max_len: float = 1.2,
+                 fs: float = 250.0, trims: dict = STEADY_STATE,
                  balance: bool = True, seed: int | None = None):
         if not 0 < min_len <= max_len:
             raise ValueError("need 0 < min_len <= max_len")
         self.min_len, self.max_len, self.fs = min_len, max_len, fs
-        self.trim_start, self.trim_end = trim_start, trim_end
+        self.trims = trims
         self.balance = balance
         self.rng = np.random.default_rng(seed)
+        self.n_fallback = 0
 
         usable = []
         for r in segments.itertuples(index=False):
-            lo, hi = r.t_start, r.t_end
-            if r.label != "rest":
-                lo, hi = lo + trim_start, hi - trim_end
+            lo, hi = usable_span(r.label, r.t_start, r.t_end, trims)
             if hi - lo >= min_len:
                 usable.append((r, lo, hi))
         if not usable:
@@ -145,6 +182,7 @@ class WindowSampler:
             pool = range(len(self.segments))
         fits = [i for i in pool if self.span[i] >= length]
         if not fits:  # no segment of this class is that long: fall back to the longest
+            self.n_fallback += 1
             fits = [max(pool, key=self.span.__getitem__)]
             length = self.span[fits[0]]
         i = fits[self.rng.integers(len(fits))]
@@ -157,17 +195,18 @@ class WindowSampler:
         return [self.sample() for _ in range(n)]
 
 
-def fixed_windows(segments: pd.DataFrame, length: float = 1.4, stride: float = 0.5,
-                  fs: float = 250.0) -> list[Window]:
-    """Deterministic, test-like windows (fixed length, regular stride) for
-    validation. Segments shorter than ``length`` yield no window."""
+def fixed_windows(segments: pd.DataFrame, length: float = 1.2, stride: float = 0.5,
+                  fs: float = 250.0, trims: dict = STEADY_STATE) -> list[Window]:
+    """Deterministic windows (fixed length, regular stride) for validation,
+    cut from the trimmed span of each segment. Segments whose span is shorter
+    than ``length`` yield no window."""
     out = []
     for r in segments.itertuples(index=False):
-        t0 = r.t_start
-        while t0 + length <= r.t_end + 1e-9:
+        lo, hi = usable_span(r.label, r.t_start, r.t_end, trims)
+        t0 = lo
+        while t0 + length <= hi + 1e-9:
             emg, imu, n_raw = make_window(r.t, r.emg, r.imu, r.imu_new, t0, length, fs)
-            out.append(Window(emg, imu, r.label, r.sample_id, r.session, length,
-                              t0 - r.t_start, n_raw))
+            out.append(Window(emg, imu, r.label, r.sample_id, r.session, length, t0 - lo, n_raw))
             t0 += stride
     return out
 
