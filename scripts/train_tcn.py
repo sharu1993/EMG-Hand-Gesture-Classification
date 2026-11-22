@@ -96,14 +96,15 @@ SWEEP = {
 }
 # Earlier results on the same folds and validation windows, for the summary table.
 REFERENCE_ROWS = [
-    # Before the switch to PiEEG's filters and row-based timing (timestamp
-    # resampling, 50/60/100/120 Hz notches); validation then had 9 steady and 12
-    # untrimmed windows more (windows with < 100 rows are now skipped).
-    {"run": "ref (old preprocessing): feature baseline Riemann+IMU", "steady_F1": 0.612,
-     "50Hz": 0.664, "60Hz": 0.425, "untrimmed_1.4s": 0.590},
-    {"run": "ref (old preprocessing): riemann_align", "steady_F1": 0.562, "50Hz": 0.612,
-     "60Hz": 0.429, "untrimmed_1.4s": 0.558},
-    {"run": "ref (old preprocessing): ensemble", "steady_F1": 0.638, "50Hz": 0.696,
+    # PiEEG's filters only (no 60/120 Hz notches), rows as 250 Hz samples.
+    {"run": "ref (PiEEG filters only): baseline Riemann+IMU", "steady_F1": 0.608, "50Hz": 0.655,
+     "60Hz": 0.434, "untrimmed_1.4s": 0.579},
+    {"run": "ref (PiEEG filters only): riemann_align", "steady_F1": 0.597, "50Hz": 0.655,
+     "60Hz": 0.408, "untrimmed_1.4s": 0.560},
+    {"run": "ref (PiEEG filters only): ensemble", "steady_F1": 0.630, "50Hz": 0.691,
+     "60Hz": 0.408, "untrimmed_1.4s": 0.611},
+    # Timestamp resampling with 50/60/100/120 Hz notches (submission scored 0.543).
+    {"run": "ref (timestamp resampling): ensemble", "steady_F1": 0.638, "50Hz": 0.696,
      "60Hz": 0.448, "untrimmed_1.4s": 0.616},
 ]
 

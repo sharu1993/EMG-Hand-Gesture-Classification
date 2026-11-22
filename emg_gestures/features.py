@@ -6,7 +6,8 @@ scales with the window length.
 
 EMG preprocessing (per window, identical for train, test and live use):
     PiEEG's filters: band-pass 20-120 Hz, band-stop 45-55 Hz (50 Hz mains),
-    notch at 100 Hz; optional common-average reference, then one gain for all channels
+    notch at 100 Hz; plus band-stop 55-65 Hz and notch at 120 Hz (60 Hz mains);
+    optional common-average reference, then one gain for all channels
     (window RMS over all channels) so that the cross-channel pattern survives
     but the per-person/per-session amplitude does not.
 
@@ -41,25 +42,36 @@ IMU_AXES = ["ax", "ay", "az", "gx", "gy", "gz"]
 
 # PiEEG's AuraNet preprocessing (huggingface.co/pieeg/Aura_Net): band-pass
 # 20-120 Hz (order 4), band-stop 45-55 Hz (order 4) for 50 Hz mains, notch at
-# its 100 Hz harmonic (Q = 30). There is deliberately no 60 Hz filter, matching
-# PiEEG's 50 Hz focus.
+# its 100 Hz harmonic (Q = 30).
 PIEEG_BANDPASS = (20.0, 120.0)
 PIEEG_BANDSTOP = (45.0, 55.0)
 PIEEG_NOTCH_HZ, PIEEG_NOTCH_Q = 100.0, 30.0
+# Added to PiEEG's set, for 60 Hz mains: a 55-65 Hz band-stop (order 4, the
+# same design as PiEEG's 50 Hz band-stop) and a notch at the 120 Hz harmonic.
+# 7 of 28 training sessions and about half the test actions (test_3, test_5)
+# were recorded with 60 Hz mains; with PiEEG's filters alone that hum stayed at
+# 135-912x the background and cost those sessions accuracy. A narrow 60 Hz
+# notch (Q = 30) only cut it to 7-49x: it needs ~0.5 s to settle, too long
+# inside a 1.2 s window, while the band-stop removes it fully.
+EXTRA_BANDSTOP = (55.0, 65.0)
+EXTRA_NOTCHES_HZ = (120.0,)
 
 
 @lru_cache(maxsize=8)
 def _filters(fs: float):
     hi = min(PIEEG_BANDPASS[1], fs / 2 - 1)
     sos = [butter(4, [PIEEG_BANDPASS[0], hi], btype="bandpass", fs=fs, output="sos"),
-           butter(4, list(PIEEG_BANDSTOP), btype="bandstop", fs=fs, output="sos")]
-    if PIEEG_NOTCH_HZ < fs / 2 - 1:
-        sos.append(tf2sos(*iirnotch(PIEEG_NOTCH_HZ, Q=PIEEG_NOTCH_Q, fs=fs)))
+           butter(4, list(PIEEG_BANDSTOP), btype="bandstop", fs=fs, output="sos"),
+           butter(4, list(EXTRA_BANDSTOP), btype="bandstop", fs=fs, output="sos")]
+    for f0 in (PIEEG_NOTCH_HZ, *EXTRA_NOTCHES_HZ):
+        if f0 < fs / 2 - 1:
+            sos.append(tf2sos(*iirnotch(f0, Q=PIEEG_NOTCH_Q, fs=fs)))
     return np.vstack(sos)
 
 
 def filter_emg(emg: np.ndarray, fs: float = 250.0, car: bool = False) -> np.ndarray:
-    """PiEEG's filters (band-pass 20-120 Hz, band-stop 45-55 Hz, 100 Hz notch).
+    """PiEEG's filters (band-pass 20-120 Hz, band-stop 45-55 Hz, 100 Hz notch)
+    plus a 55-65 Hz band-stop and a 120 Hz notch for the 60 Hz-mains recordings.
 
     PiEEG runs them causally over a whole session and drops a 0.5 s warm-up.
     Our windows are only 0.75-1.4 s long, so the same filters are applied
