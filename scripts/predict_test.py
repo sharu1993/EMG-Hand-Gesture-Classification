@@ -6,9 +6,9 @@
 --model baseline  trains a feature baseline (default: Riemann + IMU features,
                   aligned training windows; --baseline-config / --no-baseline-align)
                   on all 28 training sessions, then scores the test actions.
---model tcn       loads a checkpoint written by
-                  `train_tcn.py --final --input riemann --align` and scores the
-                  test actions with it (CPU is enough for 348 actions).
+--model tcn       loads a checkpoint written by `train_tcn.py --final` and
+                  scores the test actions with it, averaging the probabilities
+                  of all models it holds (--seeds); CPU is enough for 348 actions.
 
 Writes outputs/test_probs_<model>.npz: action_id, probs (n, 6), labels.
 Run each model in its own process (scripts/make_submission.py does): scikit-learn
@@ -70,7 +70,7 @@ def predict_baseline(actions, args) -> np.ndarray:
     keep = CONFIGS[args.baseline_config]
     cols = [c for c in train.columns if c not in META and keep(c)]
     clf = new_model(args.seed).fit(train[cols], train.label)
-    test = pd.DataFrame([window_features(e, i, riemann=True) for _, e, i in actions])
+    test = pd.DataFrame([window_features(e, i, riemann=True, corr=True) for _, e, i in actions])
     order = [list(clf.classes_).index(lab) for lab in LABELS]
     print(f"baseline '{args.baseline_config}' (align {args.baseline_align}): {len(cols)} features, "
           f"{len(train)} training windows")
@@ -85,17 +85,19 @@ def predict_tcn(actions, args) -> np.ndarray:
 
     ck = torch.load(args.checkpoint, map_location="cpu")
     kind = ck["input"]
-    model = AuraTCN(**ck["config"])
-    model.load_state_dict(ck["state_dict"])
-    model.eval()
+    models = []
+    for state in ck.get("state_dicts", [ck["state_dict"]]):   # several seeds: average them
+        m = AuraTCN(**ck["config"])
+        m.load_state_dict(state)
+        models.append(m.eval())
 
     feats = []
     for _, e, i in actions:
         e, i = preprocess(e, i)
         if kind == "frames":
             e, i = window_frames(e, i)
-        elif kind == "riemann":
-            e, i = riemann_frames(e), imu_frames(i)
+        elif kind in ("riemann", "riemann_corr"):
+            e, i = riemann_frames(e, corr=kind == "riemann_corr"), imu_frames(i)
         feats.append((e, i))
     T = max(len(e) for e, _ in feats)
     E = np.zeros((len(feats), T, feats[0][0].shape[1]), np.float32)
@@ -110,9 +112,10 @@ def predict_tcn(actions, args) -> np.ndarray:
         I = (I - st["i_mu"]) / st["i_sd"]
     mf = M.unsqueeze(-1).float()
     with torch.no_grad():
-        probs = torch.softmax(model(E * mf, I * mf, M), 1).numpy()
+        probs = np.mean([torch.softmax(m(E * mf, I * mf, M), 1).numpy() for m in models], axis=0)
     print(f"tcn '{args.checkpoint}': input {kind}, align {ck.get('align')}, "
-          f"{sum(p.numel() for p in model.parameters()):,} parameters")
+          f"person aug {ck.get('person_aug', False)}, {len(models)} model(s) averaged, "
+          f"{sum(p.numel() for p in models[0].parameters()):,} parameters each")
     return probs
 
 

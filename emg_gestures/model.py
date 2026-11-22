@@ -119,6 +119,8 @@ FRAME_CONFIG = dict(emg_in=52, imu_in=12, emg_width=48, imu_width=16, k=3,
                     emg_dilations=(1, 2, 4), imu_dilations=(1, 2))  # RF 31 frames ~1.5 s
 # Riemannian frames (emg_gestures/riemann.py): 3 bands x 36 tangent values per frame.
 RIEMANN_CONFIG = dict(FRAME_CONFIG, emg_in=108)
+# Riemannian frames plus correlation-matrix vectors: 108 + 3 bands x 28 = 192.
+RIEMANN_CORR_CONFIG = dict(FRAME_CONFIG, emg_in=192)
 
 
 class AuraTCN(nn.Module):

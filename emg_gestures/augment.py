@@ -13,6 +13,20 @@ and band placements:
   2401.02773). The 8 Aura contacts have no known ring order, so channels are
   dropped rather than rotated.
 
+Person-variation augmentation (``augment_person_signal``, optional), aimed at
+the sessions that fail when held out. In those, gestures change the EMG much
+less relative to rest (some 8% vs 21% in the others), or the whole signal is
+weaker and closer to the noise floor. Two changes per window, both applied to
+every training window alike and never at test time:
+
+* Background mixing: band-limited (20-120 Hz) noise with a random level per
+  channel is added, so the gesture's own activity is a smaller part of the
+  window (lower contrast and signal-to-noise ratio, as in those sessions).
+* Spectral tilt: the spectrum is multiplied by (f / 60 Hz)^a with a random
+  slope a (one per window plus a small per-channel part), mimicking how skin,
+  fat and electrode contact filter the signal differently from person to person.
+The window's overall level is restored afterwards, so only its shape changes.
+
 The raw-signal and frame inputs apply the same ideas on the GPU in
 scripts/train_tcn.py (``augment``); covariance (Riemannian) features are not
 linear in the signal, so for that input the signal is augmented here, before
@@ -27,6 +41,15 @@ WARP_SD = 0.15            # log-gain at each warp knot
 WARP_KNOTS = 4
 NOISE_SD = 0.05           # in units of the window gain (signals are gain-normalised)
 DROP_PROBS = (0.60, 0.20, 0.12, 0.08)   # P(0, 1, 2, 3 channels dropped)
+
+# person-variation augmentation
+BG_PROB = 0.5             # share of windows that get background mixed in
+BG_LEVEL = (0.15, 1.0)    # background RMS relative to the window's, log-uniform
+BG_CH_SD = 0.3            # per-channel log-spread of the background level
+TILT_PROB = 0.5           # share of windows that get a spectral tilt
+TILT_SD = 0.5             # slope per window (power law exponent on amplitude)
+TILT_CH_SD = 0.15         # extra slope per channel
+BG_BAND = (20.0, 120.0)
 
 
 def n_dropped(rng: np.random.Generator, size=None):
@@ -50,6 +73,28 @@ def augment_emg_signal(emg: np.ndarray, rng: np.random.Generator) -> np.ndarray:
         dead = rng.choice(emg.shape[1], size=k, replace=False)
         out[:, dead] = rng.normal(0, 0.01, (len(out), k))     # lost contact: near-silent channel
     return out
+
+
+def augment_person_signal(emg: np.ndarray, rng: np.random.Generator,
+                          fs: float = 250.0) -> np.ndarray:
+    """(T, 8) filtered, gain-normalised EMG -> copy that looks like a person
+    with weaker gesture contrast and/or different tissue filtering."""
+    T, n_ch = emg.shape
+    level = np.sqrt((emg ** 2).mean()) + 1e-9
+    f = np.fft.rfftfreq(T, 1 / fs)
+    out = emg
+    if rng.random() < TILT_PROB:
+        slope = rng.normal(0, TILT_SD) + rng.normal(0, TILT_CH_SD, n_ch)       # (8,)
+        gain = (np.maximum(f, 1.0)[:, None] / 60.0) ** slope[None, :]         # (F, 8)
+        out = np.fft.irfft(np.fft.rfft(out, axis=0) * gain, n=T, axis=0)
+    if rng.random() < BG_PROB:
+        spec = rng.normal(size=(len(f), n_ch)) + 1j * rng.normal(size=(len(f), n_ch))
+        spec[(f < BG_BAND[0]) | (f > BG_BAND[1])] = 0
+        bg = np.fft.irfft(spec, n=T, axis=0)
+        bg /= np.sqrt((bg ** 2).mean(axis=0, keepdims=True)) + 1e-12             # unit RMS per channel
+        rel = np.exp(rng.uniform(*np.log(BG_LEVEL)) + rng.normal(0, BG_CH_SD, n_ch))
+        out = out + bg * rel[None, :] * level
+    return (out * (level / (np.sqrt((out ** 2).mean()) + 1e-9))).astype(emg.dtype)
 
 
 def augment_imu_signal(imu: np.ndarray, rng: np.random.Generator) -> np.ndarray:

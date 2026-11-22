@@ -21,6 +21,13 @@ Input is preprocessed EMG (emg_gestures.model.preprocess: high-pass, mains
 notches, one gain for all channels).
 
 Per band: 36 values. Three bands: 108 values per frame or window.
+
+Correlation variant (``corr=True``): each band's covariance is also scaled to a
+correlation matrix R = D^-1/2 C D^-1/2 (D = its diagonal) and mapped the same
+way. R carries no per-channel power, only the co-activation pattern, which
+differs between gestures even for people whose gestures change channel power
+very little. logm(R) is kept off the diagonal only: 28 values per band, 84 for
+three bands, appended after the 108 covariance values (192 in total).
 """
 from __future__ import annotations
 
@@ -37,6 +44,9 @@ _IU = np.triu_indices(N_CH)
 _SCALE = np.where(_IU[0] == _IU[1], 1.0, np.sqrt(2.0))
 DIM_PER_BAND = len(_IU[0])                      # 36
 DIM = DIM_PER_BAND * len(BANDS)                 # 108
+_IU1 = np.triu_indices(N_CH, 1)
+CORR_DIM_PER_BAND = len(_IU1[0])                # 28
+CORR_DIM = CORR_DIM_PER_BAND * len(BANDS)       # 84
 SHRINK = 1e-3                                   # ridge, as a fraction of mean variance
 
 
@@ -68,20 +78,41 @@ def tangent(c: np.ndarray) -> np.ndarray:
     return logc[..., _IU[0], _IU[1]] * _SCALE
 
 
-def riemann_frames(emg: np.ndarray, fs: float = 250.0) -> np.ndarray:
-    """(T, 8) preprocessed EMG -> (F, 108), frames as in emg_gestures.frames."""
-    feats = [tangent(_cov(_framed(xb))) for xb in band_signals(emg, fs)]
+def corr_tangent(c: np.ndarray) -> np.ndarray:
+    """(..., 8, 8) SPD -> (..., 28): log-Euclidean tangent vector of the
+    correlation matrix, off-diagonal entries only (scaled by sqrt(2))."""
+    d = 1.0 / np.sqrt(np.diagonal(c, axis1=-2, axis2=-1))
+    r = c * d[..., :, None] * d[..., None, :]
+    w, v = np.linalg.eigh(r)
+    logr = np.einsum("...ij,...j,...kj->...ik", v, np.log(np.maximum(w, 1e-12)), v)
+    return logr[..., _IU1[0], _IU1[1]] * np.sqrt(2.0)
+
+
+def riemann_frames(emg: np.ndarray, fs: float = 250.0, corr: bool = False) -> np.ndarray:
+    """(T, 8) preprocessed EMG -> (F, 108), or (F, 192) with ``corr``; frames as
+    in emg_gestures.frames."""
+    covs = [_cov(_framed(xb)) for xb in band_signals(emg, fs)]
+    feats = [tangent(c) for c in covs] + ([corr_tangent(c) for c in covs] if corr else [])
     return np.concatenate(feats, axis=1).astype(np.float32)
 
 
-def riemann_window(emg: np.ndarray, fs: float = 250.0) -> np.ndarray:
-    """(T, 8) preprocessed EMG -> (108,), one covariance per band over the window."""
-    return np.concatenate([tangent(_cov(xb)) for xb in band_signals(emg, fs)]).astype(np.float32)
+def riemann_window(emg: np.ndarray, fs: float = 250.0, corr: bool = False) -> np.ndarray:
+    """(T, 8) preprocessed EMG -> (108,), or (192,) with ``corr``: one covariance
+    per band over the window."""
+    covs = [_cov(xb) for xb in band_signals(emg, fs)]
+    feats = [tangent(c) for c in covs] + ([corr_tangent(c) for c in covs] if corr else [])
+    return np.concatenate(feats).astype(np.float32)
 
 
-def feature_names() -> list[str]:
+def feature_names(corr: bool = False) -> list[str]:
+    """Covariance names emg_riem<band>_<i>_<j>; with ``corr`` also the
+    correlation names emg_rcor<band>_<i>_<j> (same order as riemann_window)."""
     names = []
     for lo, hi in BANDS:
         for i, j in zip(*_IU):
             names.append(f"emg_riem{lo}_{hi}_{i + 1}_{j + 1}")
+    if corr:
+        for lo, hi in BANDS:
+            for i, j in zip(*_IU1):
+                names.append(f"emg_rcor{lo}_{hi}_{i + 1}_{j + 1}")
     return names

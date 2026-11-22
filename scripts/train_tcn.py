@@ -13,6 +13,9 @@ Inputs (--input):
            cross-channel correlations, IMU stats (emg_gestures/frames.py). Default.
   riemann  per frame, 8x8 channel covariance in 3 bands mapped to the tangent
            space (emg_gestures/riemann.py), plus the same IMU stats
+  riemann_corr
+           riemann plus the same covariances scaled to correlation matrices
+           (co-activation pattern without channel power): 192 values per frame
   raw      the preprocessed signal itself (the first TCN version)
 
 --align      training windows from each segment's own steady span (gyro-based,
@@ -21,6 +24,12 @@ Inputs (--input):
 
 Augmentation (emg_gestures/augment.py): per-channel gain with smooth magnitude
 warping, sensor noise, and 0-3 dropped channels per window.
+--person-aug adds person-variation augmentation for the riemann inputs:
+background noise mixed in (weaker gesture contrast) and a random spectral tilt
+(different tissue filtering), see emg_gestures/augment.py.
+
+--seeds N    train N models per fold (and N for --final) with different seeds
+             and average their probabilities. The --final checkpoint holds all N.
 
 Speed: every window is preprocessed once and the whole pool sits on the device
 as padded tensors; batches are index slices and augmentation runs in torch, so
@@ -36,7 +45,7 @@ Second setup (60 Hz sessions):
 
 Runs on the Apple-silicon GPU (MPS) by default; --device cpu to override.
 
-    python scripts/train_tcn.py --sweep          # frames / riemann x fixed / aligned, one table
+    python scripts/train_tcn.py --sweep          # riemann / riemann_corr x person-aug off / on
     python scripts/train_tcn.py data/train_segments.npz                       # frames, 7-fold CV
     python scripts/train_tcn.py data/train_segments.npz --group-balance --adversarial session
     python scripts/train_tcn.py data/train_segments.npz --input raw --fold-ids 0 5 6
@@ -73,40 +82,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # macOS (OMP Error #15). emg_gestures.metrics provides the pieces we need.
 from emg_gestures.align import align_segments  # noqa: E402
 from emg_gestures.augment import (DROP_PROBS, GAIN_SD, NOISE_SD, WARP_KNOTS, WARP_SD,  # noqa: E402
-                                  augment_emg_signal, augment_imu_signal)
+                                  augment_emg_signal, augment_imu_signal,
+                                  augment_person_signal)
 from emg_gestures.frames import (BAND_COLS_OF_CHANNEL, CORR_COLS_OF_CHANNEL,  # noqa: E402
                                  EMG_DIM, imu_frames, window_frames)
 from emg_gestures.riemann import riemann_frames  # noqa: E402
 from emg_gestures.metrics import confusion, f1_per_class, macro_f1, session_folds  # noqa: E402
-from emg_gestures.model import (FRAME_CONFIG, RAW_CONFIG, RIEMANN_CONFIG, AuraTCN,  # noqa: E402
-                                count_parameters, preprocess)
+from emg_gestures.model import (FRAME_CONFIG, RAW_CONFIG, RIEMANN_CONFIG,  # noqa: E402
+                                RIEMANN_CORR_CONFIG, AuraTCN, count_parameters, preprocess)
 from emg_gestures.segments import LABELS, load_segments  # noqa: E402
 from emg_gestures.windows import (ALIGNED, LABEL_TO_ID, NO_TRIM, STEADY_STATE,  # noqa: E402
                                   WindowSampler, fixed_windows)
 
 SESSIONS_60HZ = {10, 11, 15, 16, 22, 23, 24}
+# Inputs computed from the signal (covariances are not linear in it), so their
+# augmentation runs in the signal domain when the training pool is built.
+SIGNAL_AUG_KINDS = ("riemann", "riemann_corr")
+CONFIGS = {"frames": FRAME_CONFIG, "riemann": RIEMANN_CONFIG,
+           "riemann_corr": RIEMANN_CORR_CONFIG, "raw": RAW_CONFIG}
 
-# --sweep: configurations run back to back on the same prepared data.
-# All use the new augmentation (magnitude warping, 0-3 dropped channels).
+# --sweep: configurations run back to back on the same prepared data, a 2 x 2
+# design: covariance features with / without correlation features, person-
+# variation augmentation off / on. "riemann" is the previous best TCN (control).
 SWEEP = {
-    "frames": {"input": "frames"},
-    "frames_align": {"input": "frames", "align": True},
-    "riemann": {"input": "riemann"},
-    "riemann_align": {"input": "riemann", "align": True},
+    "riemann": {"input": "riemann", "person_aug": False},
+    "riemann_pa": {"input": "riemann", "person_aug": True},
+    "riemann_corr": {"input": "riemann_corr", "person_aug": False},
+    "riemann_corr_pa": {"input": "riemann_corr", "person_aug": True},
 }
-# Earlier results on the same folds and validation windows, for the summary table.
-REFERENCE_ROWS = [
-    # PiEEG's filters only (no 60/120 Hz notches), rows as 250 Hz samples.
-    {"run": "ref (PiEEG filters only): baseline Riemann+IMU", "steady_F1": 0.608, "50Hz": 0.655,
-     "60Hz": 0.434, "untrimmed_1.4s": 0.579},
-    {"run": "ref (PiEEG filters only): riemann_align", "steady_F1": 0.597, "50Hz": 0.655,
-     "60Hz": 0.408, "untrimmed_1.4s": 0.560},
-    {"run": "ref (PiEEG filters only): ensemble", "steady_F1": 0.630, "50Hz": 0.691,
-     "60Hz": 0.408, "untrimmed_1.4s": 0.611},
-    # Timestamp resampling with 50/60/100/120 Hz notches (submission scored 0.543).
-    {"run": "ref (timestamp resampling): ensemble", "steady_F1": 0.638, "50Hz": 0.696,
-     "60Hz": 0.448, "untrimmed_1.4s": 0.616},
-]
+# Seed j of a fold's model ensemble uses seed + fold + SEED_STEP * j.
+SEED_STEP = 100
 
 # (8, EMG_DIM) indicator matrices: which frame-feature columns belong to channel c.
 _BAND_OF = np.zeros((8, EMG_DIM), np.float32)
@@ -134,19 +139,22 @@ def pick_device(name: str) -> torch.device:
 def _prep(job):
     """One window -> (emg input, imu input, label id, session, sample_id, offset).
 
-    ``aug_seed`` is set only for training windows of the riemann input: its
+    ``aug_seed`` is set only for training windows of the riemann inputs: their
     covariance features are not linear in the signal, so augmentation is applied
     to the signal here (once per window) instead of on the GPU each epoch.
+    ``person_aug`` adds the person-variation augmentation before the usual one.
     """
-    w, kind, aug_seed = job
+    w, kind, aug_seed, person_aug = job
     e, i = preprocess(w.emg, w.imu)
     if aug_seed is not None:
         rng = np.random.default_rng(aug_seed)
+        if person_aug:
+            e = augment_person_signal(e, rng)
         e, i = augment_emg_signal(e, rng), augment_imu_signal(i, rng)
     if kind == "frames":
         e, i = window_frames(e, i)
-    elif kind == "riemann":
-        e, i = riemann_frames(e), imu_frames(i)
+    elif kind in SIGNAL_AUG_KINDS:
+        e, i = riemann_frames(e, corr=kind == "riemann_corr"), imu_frames(i)
     return e, i, LABEL_TO_ID[w.label], w.session, w.sample_id, w.offset_s
 
 
@@ -154,8 +162,8 @@ class Pool:
     """All windows of one kind, padded once and kept on the device."""
 
     def __init__(self, windows, kind: str, device: torch.device, workers: int,
-                 augment_seed: int | None = None):
-        jobs = [(w, kind, None if augment_seed is None else augment_seed * 1_000_003 + k)
+                 augment_seed: int | None = None, person_aug: bool = False):
+        jobs = [(w, kind, None if augment_seed is None else augment_seed * 1_000_003 + k, person_aug)
                 for k, w in enumerate(windows)]
         with ProcessPoolExecutor(workers) as ex:
             items = list(ex.map(_prep, jobs, chunksize=128))
@@ -236,8 +244,8 @@ def _dropped_channels(B: int, gen: torch.Generator, dev) -> torch.Tensor:
 
 def augment(e, i, kind: str, std: Standardizer, gen: torch.Generator):
     """Training-time augmentation on the device, in the input's own units.
-    (The riemann input is augmented in the signal domain when the pool is built.)"""
-    if kind == "riemann":
+    (The riemann inputs are augmented in the signal domain when the pool is built.)"""
+    if kind in SIGNAL_AUG_KINDS:
         return e, i
     B, T, dev = e.shape[0], e.shape[1], e.device
     rnd = lambda *shape: torch.randn(*shape, generator=gen, device=dev)  # noqa: E731
@@ -265,7 +273,7 @@ def augment(e, i, kind: str, std: Standardizer, gen: torch.Generator):
 
 def feature_noise(e, i, kind: str, gen: torch.Generator):
     """Noise in standardised units (frame and riemann inputs)."""
-    if kind in ("frames", "riemann"):
+    if kind == "frames" or kind in SIGNAL_AUG_KINDS:
         e = e + 0.1 * torch.randn(e.shape, generator=gen, device=e.device)
         i = i + 0.1 * torch.randn(i.shape, generator=gen, device=i.device)
     return e, i
@@ -274,7 +282,7 @@ def feature_noise(e, i, kind: str, gen: torch.Generator):
 # ----------------------------------------------------------------------- training
 
 def model_config(args) -> dict:
-    cfg = dict({"frames": FRAME_CONFIG, "riemann": RIEMANN_CONFIG, "raw": RAW_CONFIG}[args.input])
+    cfg = dict(CONFIGS[args.input])
     cfg.update(dropout=args.dropout, use_imu=not args.no_imu)
     return cfg
 
@@ -282,7 +290,7 @@ def model_config(args) -> dict:
 def train_model(pool: Pool, idx: torch.Tensor, args, device, seed: int):
     torch.manual_seed(seed)
     gen = torch.Generator(device=device).manual_seed(seed)
-    std = Standardizer(pool, idx, enabled=args.input in ("frames", "riemann"))
+    std = Standardizer(pool, idx, enabled=args.input != "raw")
 
     # domain labels for adversarial training
     if args.adversarial == "session":
@@ -370,7 +378,7 @@ def main() -> None:
                     help="segment file (default data/train_segments.npz)")
     ap.add_argument("--sweep", action="store_true",
                     help="run all configurations in SWEEP on the same data, print a comparison")
-    ap.add_argument("--input", choices=["frames", "riemann", "raw"], default="frames")
+    ap.add_argument("--input", choices=list(CONFIGS), default="frames")
     ap.add_argument("--align", action="store_true",
                     help="training windows from per-segment aligned steady spans "
                          "(emg_gestures/align.py); validation keeps the fixed trims")
@@ -385,6 +393,11 @@ def main() -> None:
     ap.add_argument("--weight-decay", type=float, default=1e-2)
     ap.add_argument("--dropout", type=float, default=0.15)
     ap.add_argument("--no-imu", action="store_true")
+    ap.add_argument("--person-aug", action=argparse.BooleanOptionalAction, default=False,
+                    help="person-variation augmentation (riemann inputs only); the sweep sets "
+                         "it per run")
+    ap.add_argument("--seeds", type=int, default=1,
+                    help="models per fold (and for --final), averaged; each gets its own seed")
     ap.add_argument("--group-balance", action="store_true",
                     help="weight the loss so 50 Hz and 60 Hz sessions count equally")
     ap.add_argument("--adversarial", choices=["none", "setup", "session"], default="none")
@@ -405,14 +418,20 @@ def main() -> None:
     data = DataCache(load_segments(args.segments), args, device)
 
     if args.final:
-        train, _, _ = data.pools(args.input, args.align)
-        model, std = train_model(train, torch.arange(len(train), device=device), args, device, args.seed)
-        state = {k: v.detach().cpu() for k, v in model.state_dict().items()
-                 if not k.startswith("domain_head")}          # loadable without MPS
+        train, _, _ = data.pools(args.input, args.align, args.person_aug)
+        states = []
+        for j in range(args.seeds):
+            model, std = train_model(train, torch.arange(len(train), device=device), args, device,
+                                     args.seed + SEED_STEP * j)
+            states.append({k: v.detach().cpu() for k, v in model.state_dict().items()
+                           if not k.startswith("domain_head")})          # loadable without MPS
+            print(f"model {j + 1}/{args.seeds} trained ({time.time() - t0:.0f} s)", flush=True)
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"state_dict": state, "labels": LABELS, "input": args.input, "align": args.align,
+        # the standardizer depends only on the training pool, so it is the same for every seed
+        torch.save({"state_dict": states[0], "state_dicts": states, "labels": LABELS,
+                    "input": args.input, "align": args.align, "person_aug": args.person_aug,
                     "config": model_config(args), "standardizer": std.state()}, args.out)
-        print(f"saved {args.out} ({time.time() - t0:.0f} s)")
+        print(f"saved {args.out} ({args.seeds} model(s), {time.time() - t0:.0f} s)")
         return
 
     if args.sweep:
@@ -421,16 +440,17 @@ def main() -> None:
             run_args = argparse.Namespace(**{**vars(args), **overrides})
             run_args.report = args.report.parent / f"tcn_{name}.json"
             print(f"\n=== {name}: input {run_args.input}, align {run_args.align}, "
+                  f"person aug {run_args.person_aug}, seeds {run_args.seeds}, "
                   f"group balance {run_args.group_balance}, adversarial {run_args.adversarial}",
                   flush=True)
             t1 = time.time()
-            train, val, raw = data.pools(run_args.input, run_args.align)
+            train, val, raw = data.pools(run_args.input, run_args.align, run_args.person_aug)
             report = cross_validate(train, val, raw, run_args, device, t0, show_details=False)
             rows.append({"run": name, "steady_F1": report["steady_macro_F1"],
                          "50Hz": report["50Hz_sessions"], "60Hz": report["60Hz_sessions"],
                          "untrimmed_1.4s": report["untrimmed_1.4s_macro_F1"],
                          "minutes": (time.time() - t1) / 60})
-        table = pd.DataFrame(rows + REFERENCE_ROWS).set_index("run")
+        table = pd.DataFrame(rows).set_index("run")
         print("\nSummary: macro F1, sessions held out (same folds as the baseline)")
         print(table.round(3).to_string())
         out = args.report.parent / "tcn_sweep.csv"
@@ -439,7 +459,7 @@ def main() -> None:
               f"{(time.time() - t0) / 60:.1f} min")
         return
 
-    train, val, raw = data.pools(args.input, args.align)
+    train, val, raw = data.pools(args.input, args.align, args.person_aug)
     cross_validate(train, val, raw, args, device, t0, show_details=True)
 
 
@@ -470,26 +490,28 @@ class DataCache:
             self._train_w[align] = w
         return self._train_w[align]
 
-    def pools(self, kind: str, align: bool):
+    def pools(self, kind: str, align: bool, person_aug: bool = False):
         a, t0 = self.args, time.time()
+        person_aug = person_aug and kind in SIGNAL_AUG_KINDS
+        key = ("train", kind, align, person_aug)
         if ("val", kind) not in self._pools:
             self._pools[("val", kind)] = Pool(self.val_w, kind, self.device, a.workers)
             self._pools[("raw", kind)] = Pool(self.raw_w, kind, self.device, a.workers)
-        if ("train", kind, align) not in self._pools:
-            aug_seed = a.seed + 1 if kind == "riemann" else None   # signal-domain augmentation
-            self._pools[("train", kind, align)] = Pool(self.train_windows(align), kind, self.device,
-                                                       a.workers, augment_seed=aug_seed)
+        if key not in self._pools:
+            aug_seed = a.seed + 1 if kind in SIGNAL_AUG_KINDS else None   # signal-domain augmentation
+            self._pools[key] = Pool(self.train_windows(align), kind, self.device, a.workers,
+                                    augment_seed=aug_seed, person_aug=person_aug)
             cfg_args = argparse.Namespace(**{**vars(a), "input": kind})
             probe = AuraTCN(**model_config(cfg_args))
             unit = "samples" if kind == "raw" else "frames"
-            print(f"device {self.device}; input {kind}; align {align}; "
-                  f"{len(self._pools[('train', kind, align)])} train / "
+            print(f"device {self.device}; input {kind}; align {align}; person aug {person_aug}; "
+                  f"{len(self._pools[key])} train / "
                   f"{len(self._pools[('val', kind)])} steady val / "
                   f"{len(self._pools[('raw', kind)])} untrimmed windows; model "
                   f"{count_parameters(probe):,} parameters (receptive field "
                   f"{probe.receptive_field} {unit}); data ready in {time.time() - t0:.0f} s",
                   flush=True)
-        return (self._pools[("train", kind, align)], self._pools[("val", kind)],
+        return (self._pools[key], self._pools[("val", kind)],
                 self._pools[("raw", kind)])
 
 
@@ -507,10 +529,12 @@ def cross_validate(train: Pool, val: Pool, raw: Pool, args, device, t0: float,
         held = folds[k].tolist()
         # index sets built in NumPy (torch.isin is not available on every MPS build)
         tr_idx = torch.from_numpy(np.flatnonzero(~np.isin(train.session_np, held))).to(device)
-        model, std = train_model(train, tr_idx, args, device, args.seed + k)
-        for pool, prob in ((val, prob_val), (raw, prob_raw)):
-            idx_np = np.flatnonzero(np.isin(pool.session_np, held))
-            prob[idx_np] = predict(model, std, pool, torch.from_numpy(idx_np).to(device))
+        for j in range(args.seeds):                       # seed averaging: mean of the models' probabilities
+            model, std = train_model(train, tr_idx, args, device, args.seed + k + SEED_STEP * j)
+            for pool, prob in ((val, prob_val), (raw, prob_raw)):
+                idx_np = np.flatnonzero(np.isin(pool.session_np, held))
+                p = predict(model, std, pool, torch.from_numpy(idx_np).to(device)) / args.seeds
+                prob[idx_np] = p if j == 0 else prob[idx_np] + p
         vi = np.isin(val.session_np, held)
         f1 = macro_f1(val.y_np[vi], prob_val[vi].argmax(1))
         print(f"fold {k + 1}/{args.folds} sessions {held}: steady macro F1 {f1:.3f} "

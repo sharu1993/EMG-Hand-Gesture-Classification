@@ -9,7 +9,9 @@ Without that file, or with --default-pair, the Riemann TCN with aligned
 windows + the Riemann + IMU feature baseline with aligned windows.
 
 Steps (each in its own process: scikit-learn and PyTorch must not share one on macOS):
-  1. train the chosen TCN on all 28 sessions -> models/aura_tcn_<input>[_align].pt;
+  1. train the chosen TCN on all 28 sessions, --tcn-seeds models (default 3,
+     averaged) -> models/aura_tcn_<input>[_align][_pa].pt (_pa: person-variation
+     augmentation);
      skipped if that checkpoint already exists, unless --retrain (retrain after
      any change to preprocessing or training code)
   2. TCN probabilities for the 348 test actions   (predict_test.py --model tcn)
@@ -41,6 +43,7 @@ from emg_gestures.segments import LABELS  # noqa: E402
 # (TCN input, TCN aligned, baseline feature set, baseline aligned) used when no
 # usable outputs/ensemble_choice.json exists.
 DEFAULT_PAIR = ("riemann", True, "Riemann + IMU", True)
+DEFAULT_PERSON_AUG = False
 
 
 def run(step: str, cmd: list[str]) -> None:
@@ -65,8 +68,10 @@ def main() -> None:
     ap.add_argument("--retrain", action="store_true", help="retrain the TCN checkpoint")
     ap.add_argument("--device", default="mps", help="for TCN training (mps, cuda or cpu)")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--tcn-seeds", type=int, default=3,
+                    help="TCN models trained with different seeds and averaged (default 3)")
     ap.add_argument("--checkpoint", type=Path, default=None,
-                    help="TCN checkpoint (default models/aura_tcn_<input>[_align].pt)")
+                    help="TCN checkpoint (default models/aura_tcn_<input>[_align][_pa].pt)")
     ap.add_argument("--choice", type=Path, default=ROOT / "outputs/ensemble_choice.json",
                     help="model pair picked by `ensemble.py --auto` (written by run_all.py)")
     ap.add_argument("--default-pair", action="store_true",
@@ -80,10 +85,12 @@ def main() -> None:
 
     py, t0 = sys.executable, time.time()
     tcn_input, tcn_align, base_config, base_align = DEFAULT_PAIR
+    person_aug = DEFAULT_PERSON_AUG
     if not args.default_pair and args.choice.exists():
         choice = json.loads(args.choice.read_text())
         if choice.get("usable_for_submission"):
             tcn_input, tcn_align = choice["tcn"]["input"], bool(choice["tcn"]["align"])
+            person_aug = bool(choice["tcn"].get("person_aug", False))
             base_config, base_align = choice["baseline"]["config"], bool(choice["baseline"]["align"])
             sc = choice.get("scores", {})
             print(f"using the pair from {args.choice.name} (ranked by {choice.get('rank_by')}): "
@@ -95,10 +102,13 @@ def main() -> None:
     else:
         print("using the default pair" + ("" if args.default_pair else
               f" ({args.choice.name} not found; run scripts/run_all.py to create it)"))
-    print(f"  TCN: input {tcn_input}, align {tcn_align} | baseline: {base_config}, align {base_align}")
+    print(f"  TCN: input {tcn_input}, align {tcn_align}, person aug {person_aug}, "
+          f"{args.tcn_seeds} seed(s) | baseline: {base_config}, align {base_align}")
     if args.checkpoint is None:
-        args.checkpoint = ROOT / f"models/aura_tcn_{tcn_input}{'_align' if tcn_align else ''}.pt"
+        args.checkpoint = ROOT / (f"models/aura_tcn_{tcn_input}{'_align' if tcn_align else ''}"
+                                  f"{'_pa' if person_aug else ''}.pt")
     quick_tcn = ["--per-session", "20", "--epochs", "1"] if args.quick else []
+    seeds = ["--seeds", "1" if args.quick else str(args.tcn_seeds)]
     quick_base = ["--per-session", "20"] if args.quick else []
     workers = ["--workers", str(args.workers)]
 
@@ -106,6 +116,7 @@ def main() -> None:
         run("1/3 train TCN on all sessions",
             [py, "scripts/train_tcn.py", "--final", "--input", tcn_input,
              *(["--align"] if tcn_align else []),
+             "--person-aug" if person_aug else "--no-person-aug", *seeds,
              "--device", args.device, "--out", str(args.checkpoint), *workers, *quick_tcn])
     else:
         print(f"using existing checkpoint {args.checkpoint} (pass --retrain to rebuild it)")

@@ -53,6 +53,7 @@ SESSIONS_60HZ = {10, 11, 15, 16, 22, 23, 24}
 RANK_KEYS = {"balanced": "balanced", "steady": "steady_F1", "untrimmed": "untrimmed_1.4s"}
 # baseline.py file slugs -> its feature-set names (CONFIGS / ABLATIONS)
 BASELINE_CONFIGS = {"emg_imu": "EMG + IMU", "riemann_imu": "Riemann + IMU",
+                    "riemann_corr_imu": "Riemann + Corr + IMU",
                     "emg_riemann_imu": "EMG + Riemann + IMU", "emg": "EMG",
                     "emg_gain": "EMG + gain", "imu": "IMU"}
 
@@ -118,6 +119,7 @@ def model_info(path: Path) -> dict:
         extras = {k: args.get(k) for k in ("group_balance", "adversarial") if k in args}
         return {"kind": "tcn", "name": name, "input": args.get("input"),
                 "align": args.get("align") == "True",
+                "person_aug": args.get("person_aug") == "True",   # absent in older reports: off
                 "extras_default": extras in ({}, {"group_balance": "False", "adversarial": "none"}),
                 "report": report.name if report.exists() else None}
     slug = name[len("baseline_"):]
@@ -241,7 +243,7 @@ def main() -> None:
         path = args.outdir / "ensemble_choice.json"
         path.write_text(json.dumps(choice, indent=1, default=str))
         print(f"saved {path}: TCN {info[0]['name']} (input {info[0].get('input')}, "
-              f"align {info[0].get('align')}) + baseline {info[1]['name']} "
+              f"align {info[0].get('align')}, person aug {info[0].get('person_aug')}) + baseline {info[1]['name']} "
               f"({info[1].get('config')}, align {info[1].get('align')})")
         for p in problems:
             print(f"WARNING: {p}; make_submission.py will fall back to its default pair")

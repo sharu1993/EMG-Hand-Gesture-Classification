@@ -1,10 +1,12 @@
 """Run the whole evaluation in one go:
 
     1. feature baseline with per-segment alignment   (scripts/baseline.py --align)
-    2. TCN sweep: frames / riemann x fixed / aligned  (scripts/train_tcn.py --sweep)
+    2. TCN sweep: riemann / riemann + correlation x person-variation augmentation
+       off / on                                      (scripts/train_tcn.py --sweep)
     3. ensemble of the best TCN and the best baseline (scripts/ensemble.py --auto)
 
     python scripts/run_all.py              # full run (~1 hour on Apple-silicon MPS)
+    python scripts/run_all.py --seeds 3    # average 3 TCN seeds per fold (~3x the TCN time)
     python scripts/run_all.py --quick      # tiny settings, ~3 min: checks that everything runs
 
 Each step runs in its own Python process (scikit-learn and PyTorch must not
@@ -52,6 +54,8 @@ def main() -> None:
     ap.add_argument("--quick", action="store_true", help="tiny settings to check the pipeline runs")
     ap.add_argument("--device", default="mps", help="passed to the TCN step (mps, cuda or cpu)")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--seeds", type=int, default=1,
+                    help="TCN models per fold, averaged (the submission uses 3 regardless)")
     ap.add_argument("--outdir", type=Path, default=Path("outputs"))
     args = ap.parse_args()
 
@@ -63,7 +67,8 @@ def main() -> None:
         ("1/3 feature baseline", [py, "scripts/baseline.py", "--align", "--outdir", str(outdir),
                                    *workers, *(QUICK["baseline"] if args.quick else [])]),
         ("2/3 TCN sweep", [py, "scripts/train_tcn.py", "--sweep", "--device", args.device,
-                           "--report", str(outdir / "tcn_cv.json"), *workers,
+                           "--report", str(outdir / "tcn_cv.json"), "--seeds", str(args.seeds),
+                           *workers,
                            *(QUICK["tcn"] if args.quick else [])]),
         ("3/3 ensemble", [py, "scripts/ensemble.py", "--auto", "--outdir", str(outdir)]),
     ]

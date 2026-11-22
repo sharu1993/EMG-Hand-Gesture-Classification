@@ -45,21 +45,26 @@ from emg_gestures.windows import (ALIGNED, NO_TRIM, STEADY_STATE, WindowSampler,
 SESSIONS_60HZ = {10, 11, 15, 16, 22, 23, 24}
 META = ("label", "session", "length_s", "offset_s", "sample_id")
 
+# Feature-name prefixes: emg_riem = covariance tangent vectors, emg_rcor = the
+# same covariances as correlation matrices (pattern only), emg_ = other EMG
+# features, imu_ = IMU features (emg_gestures/features.py).
+_RIEM = ("emg_riem", "emg_rcor")
 CONFIGS = {
     # name: feature-name filter
-    "EMG + IMU": lambda c: c != "emg_gain" and not c.startswith("emg_riem"),
+    "EMG + IMU": lambda c: c != "emg_gain" and not c.startswith(_RIEM),
     "Riemann + IMU": lambda c: c.startswith("emg_riem") or c.startswith("imu_"),
-    "EMG + Riemann + IMU": lambda c: c != "emg_gain",
+    "Riemann + Corr + IMU": lambda c: c.startswith(_RIEM) or c.startswith("imu_"),
+    "EMG + Riemann + IMU": lambda c: c != "emg_gain" and not c.startswith("emg_rcor"),
 }
 ABLATIONS = {
-    "EMG": lambda c: c.startswith("emg_") and c != "emg_gain" and not c.startswith("emg_riem"),
-    "EMG + gain": lambda c: c.startswith("emg_") and not c.startswith("emg_riem"),
+    "EMG": lambda c: c.startswith("emg_") and c != "emg_gain" and not c.startswith(_RIEM),
+    "EMG + gain": lambda c: c.startswith("emg_") and not c.startswith(_RIEM),
     "IMU": lambda c: c.startswith("imu_"),
 }
 
 
 def _feats(w):
-    f = window_features(w.emg, w.imu, riemann=True)  # IMU already low-passed in make_window
+    f = window_features(w.emg, w.imu, riemann=True, corr=True)  # IMU already low-passed in make_window
     f.update(label=w.label, session=w.session, length_s=w.length_s, offset_s=w.offset_s,
              sample_id=w.sample_id)
     return f

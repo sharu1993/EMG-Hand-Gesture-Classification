@@ -144,17 +144,19 @@ def imu_features(imu: np.ndarray) -> dict[str, float]:
     return out
 
 
-def riemann_features(emg: np.ndarray, fs: float = 250.0) -> dict[str, float]:
+def riemann_features(emg: np.ndarray, fs: float = 250.0, corr: bool = False) -> dict[str, float]:
     """Multi-band covariance tangent vectors (emg_gestures/riemann.py) of the
-    filtered, gain-normalised window: emg_riem<band>_<i>_<j>, 108 values."""
+    filtered, gain-normalised window: emg_riem<band>_<i>_<j>, 108 values; with
+    ``corr`` also the correlation-matrix vectors emg_rcor<band>_<i>_<j>, 84 values."""
     y = filter_emg(emg, fs)
     y = y / (np.sqrt((y ** 2).mean()) + 1e-9)
-    return dict(zip(riemann_feature_names(), riemann_window(y, fs).tolist()))
+    return dict(zip(riemann_feature_names(corr), riemann_window(y, fs, corr).tolist()))
 
 
 def window_features(emg: np.ndarray, imu: np.ndarray, fs: float = 250.0,
-                    car: bool = False, riemann: bool = False) -> dict[str, float]:
+                    car: bool = False, riemann: bool = False,
+                    corr: bool = False) -> dict[str, float]:
     out = {**emg_features(emg, fs, car), **imu_features(imu)}
     if riemann:
-        out.update(riemann_features(emg, fs))
+        out.update(riemann_features(emg, fs, corr))
     return out
