@@ -1,12 +1,12 @@
 """Hand-crafted EMG/IMU features for one window (baseline models).
 
-Input is a window from ``emg_gestures.windows`` (resampled to ``fs``, mean-
-centred). Every feature is a rate, a ratio or a log-power, so none of them
+Input is a window from ``emg_gestures.windows`` (rows taken as consecutive
+250 Hz samples, mean-centred). Every feature is a rate, a ratio or a log-power, so none of them
 scales with the window length.
 
 EMG preprocessing (per window, identical for train, test and live use):
-    high-pass 20 Hz, notches at 50/60/100/120 Hz (mains differs by site),
-    optional common-average reference, then one gain for all channels
+    PiEEG's filters: band-pass 20-120 Hz, band-stop 45-55 Hz (50 Hz mains),
+    notch at 100 Hz; optional common-average reference, then one gain for all channels
     (window RMS over all channels) so that the cross-channel pattern survives
     but the per-person/per-session amplitude does not.
 
@@ -39,18 +39,35 @@ BANDS = [(20, 45), (55, 95), (105, 125)]
 IMU_AXES = ["ax", "ay", "az", "gx", "gy", "gz"]
 
 
+# PiEEG's AuraNet preprocessing (huggingface.co/pieeg/Aura_Net): band-pass
+# 20-120 Hz (order 4), band-stop 45-55 Hz (order 4) for 50 Hz mains, notch at
+# its 100 Hz harmonic (Q = 30). There is deliberately no 60 Hz filter, matching
+# PiEEG's 50 Hz focus.
+PIEEG_BANDPASS = (20.0, 120.0)
+PIEEG_BANDSTOP = (45.0, 55.0)
+PIEEG_NOTCH_HZ, PIEEG_NOTCH_Q = 100.0, 30.0
+
+
 @lru_cache(maxsize=8)
 def _filters(fs: float):
-    sos = [butter(4, 20, btype="high", fs=fs, output="sos")]
-    for f0 in (50, 60, 100, 120):
-        if f0 < fs / 2 - 1:
-            sos.append(tf2sos(*iirnotch(f0, Q=30, fs=fs)))
+    hi = min(PIEEG_BANDPASS[1], fs / 2 - 1)
+    sos = [butter(4, [PIEEG_BANDPASS[0], hi], btype="bandpass", fs=fs, output="sos"),
+           butter(4, list(PIEEG_BANDSTOP), btype="bandstop", fs=fs, output="sos")]
+    if PIEEG_NOTCH_HZ < fs / 2 - 1:
+        sos.append(tf2sos(*iirnotch(PIEEG_NOTCH_HZ, Q=PIEEG_NOTCH_Q, fs=fs)))
     return np.vstack(sos)
 
 
 def filter_emg(emg: np.ndarray, fs: float = 250.0, car: bool = False) -> np.ndarray:
-    """High-pass + mains notches (zero-phase within the window); optional CAR."""
-    y = sosfiltfilt(_filters(fs), emg, axis=0, padtype="even")
+    """PiEEG's filters (band-pass 20-120 Hz, band-stop 45-55 Hz, 100 Hz notch).
+
+    PiEEG runs them causally over a whole session and drops a 0.5 s warm-up.
+    Our windows are only 0.75-1.4 s long, so the same filters are applied
+    zero-phase (forward-backward) within each window instead: no warm-up is
+    lost and no phase shift is introduced. For live streaming, the causal
+    version over the continuous signal is the equivalent."""
+    sos = _filters(fs)
+    y = sosfiltfilt(sos, emg, axis=0, padtype="even", padlen=min(len(emg) - 1, 3 * 2 * len(sos)))
     if car:
         y = y - y.mean(axis=1, keepdims=True)
     return y

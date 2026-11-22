@@ -48,7 +48,8 @@ def _band_sos(fs: float):
 
 def band_signals(emg: np.ndarray, fs: float = 250.0) -> list[np.ndarray]:
     """(T, 8) -> list of (T, 8), one zero-phase band-passed copy per band."""
-    return [sosfiltfilt(sos, emg, axis=0, padtype="even") for sos in _band_sos(fs)]
+    return [sosfiltfilt(sos, emg, axis=0, padtype="even", padlen=min(len(emg) - 1, 3 * 2 * len(sos)))
+            for sos in _band_sos(fs)]
 
 
 def _cov(x: np.ndarray) -> np.ndarray:

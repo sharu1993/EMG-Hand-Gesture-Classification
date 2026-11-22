@@ -96,12 +96,15 @@ SWEEP = {
 }
 # Earlier results on the same folds and validation windows, for the summary table.
 REFERENCE_ROWS = [
-    {"run": "ref: feature baseline (HGB)", "steady_F1": 0.476, "50Hz": 0.539, "60Hz": 0.265,
-     "untrimmed_1.4s": 0.458},
-    {"run": "ref: frame TCN, old augmentation", "steady_F1": 0.451, "50Hz": 0.522, "60Hz": 0.237,
-     "untrimmed_1.4s": 0.464},
-    {"run": "ref: raw-signal TCN", "steady_F1": 0.413, "50Hz": 0.471, "60Hz": 0.241,
-     "untrimmed_1.4s": 0.442},
+    # Before the switch to PiEEG's filters and row-based timing (timestamp
+    # resampling, 50/60/100/120 Hz notches); validation then had 9 steady and 12
+    # untrimmed windows more (windows with < 100 rows are now skipped).
+    {"run": "ref (old preprocessing): feature baseline Riemann+IMU", "steady_F1": 0.612,
+     "50Hz": 0.664, "60Hz": 0.425, "untrimmed_1.4s": 0.590},
+    {"run": "ref (old preprocessing): riemann_align", "steady_F1": 0.562, "50Hz": 0.612,
+     "60Hz": 0.429, "untrimmed_1.4s": 0.558},
+    {"run": "ref (old preprocessing): ensemble", "steady_F1": 0.638, "50Hz": 0.696,
+     "60Hz": 0.448, "untrimmed_1.4s": 0.616},
 ]
 
 # (8, EMG_DIM) indicator matrices: which frame-feature columns belong to channel c.

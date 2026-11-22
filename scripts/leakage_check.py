@@ -57,7 +57,7 @@ def main() -> None:
     rows.append(("whole segments", len(y), grouped_macro_f1(X, y, g), chance_f1(y)))
 
     # 2. Sampled windows: same features plus where the window starts.
-    # 2. Sampled windows. The model sees only the resampled arrays, so their
+    # 2. Sampled windows. The model sees only the window arrays, so their
     #    length is the one timing feature it can use; it must sit at chance.
     #    Raw row count/rate and offset are not visible to the model; they are
     #    reported as diagnostics.
@@ -69,7 +69,7 @@ def main() -> None:
     y = np.array([w.label for w in ws])
     g = np.array([w.session for w in ws])
     feats = {
-        "windows: resampled length (model-visible)": [[len(w.emg)] for w in ws],
+        "windows: samples per window (model-visible)": [[len(w.emg)] for w in ws],
         "windows: raw rows + row rate (hidden)": [[w.n_rows_raw, w.n_rows_raw / w.length_s] for w in ws],
         "windows: offset in segment (hidden)": [[w.offset_s] for w in ws],
     }

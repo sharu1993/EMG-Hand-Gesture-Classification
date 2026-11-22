@@ -1,21 +1,23 @@
 """Duration-agnostic training windows for the Aura gesture data.
 
-Whole segments leak their length (gestures ~3 s, rest ~1.3 s) and the device's
-bursty row rate, so the model never sees them directly. Instead every sample is
-a window of random length cut at a random position inside the steady part of a labelled segment,
-resampled onto an even time grid and mean-centred per channel, matching the
-test-set format:
+Whole segments leak their length (gestures ~3 s, rest ~1.3 s), so the model
+never sees them directly. Instead every sample is a window of random length cut
+at a random position inside the steady part of a labelled segment, cut by
+timestamp like the test actions and mean-centred per channel:
 
     1. draw a length L ~ U[min_len, max_len] seconds, the same way for every class
     2. pick a class uniformly (class-balanced), then a segment of that class at
        least L long, then a random start so the window fits inside it (after
        optional onset/offset trimming)
-    3. regularise the row times (packet-arrival jitter) and resample EMG and the
-       fresh IMU readings onto a uniform grid at ``fs`` Hz
+    3. use the selected rows as consecutive 250 Hz samples (the timestamps are
+       packet arrival times, see ``make_window``); interpolate the IMU's fresh
+       readings over row positions
     4. subtract each channel's mean over the window
 
 Every class therefore produces windows from the same length distribution, so
-length carries no information about the label.
+length carries no information about the label (the number of rows in a window
+also depends on the session's packet rate; scripts/leakage_check.py verifies
+that neither predicts the label).
 
 Transitions are excluded by default. Movement into a gesture starts ~0.3 s after
 the label begins and settles by ~1.2 s; the release starts ~0.3 s before the
@@ -50,6 +52,15 @@ LABEL_TO_ID = {lab: i for i, lab in enumerate(LABELS)}
 STEADY_STATE = {"trim_start": 1.2, "trim_end": 0.4, "rest_trim_start": 0.3, "rest_trim_end": 0.0}
 NO_TRIM = {"trim_start": 0.0, "trim_end": 0.0, "rest_trim_start": 0.0, "rest_trim_end": 0.0}
 IMU_LOWPASS_HZ = 10.0  # below the slower IMU setup's Nyquist (~22 Hz)
+# A timestamp-cut window can hold very few rows where packets were dropped
+# (as few as 12 rows in 0.75 s). Below this many samples (0.4 s at 250 Hz) a
+# window is redrawn (training) or skipped (validation). Every test action has
+# at least 120 rows.
+MIN_ROWS = 100
+
+
+class TooFewRows(ValueError):
+    pass
 
 
 # Use per-segment steady spans from emg_gestures.align.align_segments instead of
@@ -76,63 +87,51 @@ def _imu_lowpass(fs: float, cutoff: float):
 
 @dataclass
 class Window:
-    emg: np.ndarray        # (n, 8) resampled, mean-centred
-    imu: np.ndarray        # (n, 6) resampled, mean-centred
+    emg: np.ndarray        # (n, 8) rows as 250 Hz samples, mean-centred
+    imu: np.ndarray        # (n, 6) fresh readings interpolated over rows, mean-centred
     label: str
     sample_id: str         # source segment
     session: int
-    length_s: float        # window length in seconds
+    length_s: float        # window length in timestamp seconds (as the test actions)
     offset_s: float        # start relative to the start of the trimmed span
-    n_rows_raw: int        # rows in the raw window, kept only for leakage checks
+    n_rows_raw: int        # rows in the window (= samples the model sees)
 
 
-def regularize_time(t: np.ndarray) -> np.ndarray:
-    """Row times on a straight line fitted to (row index, timestamp).
-
-    Timestamps are packet-arrival times: rows come in bursts that share a
-    timestamp. Within a short window the device samples at a near-constant
-    rate, so a least-squares line through the timestamps gives each row a
-    jitter-free time while keeping the window's real duration.
-    """
-    idx = np.arange(len(t), dtype=float)
-    if len(t) < 2 or np.ptp(t) == 0:
-        return t.astype(float)
-    slope, intercept = np.polyfit(idx, t, 1)
-    return intercept + slope * idx
-
-
-def resample(t: np.ndarray, x: np.ndarray, t0: float, n: int, fs: float) -> np.ndarray:
-    """Linear interpolation of x(t) onto t0 + k/fs, k = 0..n-1 (per column)."""
-    grid = t0 + np.arange(n) / fs
-    return np.column_stack([np.interp(grid, t, x[:, j]) for j in range(x.shape[1])])
-
-
-def make_window(t, emg, imu, imu_new, t0, length_s, fs=250.0, imu_lowpass=IMU_LOWPASS_HZ):
+def make_window(t, emg, imu, imu_new, t0, length_s, fs=250.0, imu_lowpass=IMU_LOWPASS_HZ,
+                min_rows: int = MIN_ROWS):
     """Cut [t0, t0 + length_s) from one segment's raw arrays and normalise it.
 
-    The IMU is low-passed at ``imu_lowpass`` Hz after resampling. The two
-    recording setups update the IMU at ~95 Hz and ~45 Hz; without a common
-    bandwidth, IMU roughness identifies the setup instead of the gesture.
+    Rows are selected by timestamp, the same way the organisers cut the test
+    actions, but the selected rows are then used as consecutive samples at the
+    device rate (250 Hz), without resampling. The timestamps are packet arrival
+    times, not sample times: counting rows at 250 Hz puts every session's mains
+    peak within 0.2 Hz of exactly 50 or 60 Hz, while the timestamps put it ~5 Hz
+    off (dropped packets lower the apparent rate to 163-240 rows/s). Resampling
+    to the timestamps would stretch each window's frequency axis by a
+    session-dependent factor and move mains off the filters.
+
+    The IMU is updated on only some rows; its fresh readings are interpolated
+    over row positions, then low-passed at ``imu_lowpass`` Hz. The two recording
+    setups update the IMU at ~100 Hz and ~47 Hz; without a common bandwidth, IMU
+    roughness identifies the setup instead of the gesture.
     """
     rows = np.flatnonzero((t >= t0) & (t < t0 + length_s))
-    if len(rows) < 2:
-        raise ValueError("window contains fewer than two rows")
-    tr = regularize_time(t[rows])
-    n = max(2, int(round(length_s * fs)))
-    emg_w = resample(tr, emg[rows], tr[0], n, fs)
-    fresh = rows[imu_new[rows] == 1]
-    if len(fresh) >= 2:
-        # IMU values are held between updates; interpolate fresh readings only,
-        # at the regularised times of those same rows.
-        imu_w = resample(tr[np.isin(rows, fresh)], imu[fresh], tr[0], n, fs)
+    if len(rows) < max(min_rows, 2):
+        raise TooFewRows(f"window holds {len(rows)} rows (< {min_rows})")
+    n = len(rows)
+    emg_w = emg[rows].astype(np.float64)
+    pos = np.flatnonzero(imu_new[rows] == 1)
+    if len(pos) >= 2:
+        idx = np.arange(n)
+        imu_w = np.column_stack([np.interp(idx, pos, imu[rows[pos], j]) for j in range(imu.shape[1])])
     else:
-        imu_w = np.repeat(imu[rows[:1]], n, axis=0)
-    if imu_lowpass:
+        imu_w = np.repeat(imu[rows[:1]].astype(np.float64), n, axis=0)
+    if imu_lowpass and n > 3:
         imu_w = sosfiltfilt(_imu_lowpass(fs, imu_lowpass), imu_w, axis=0,
                             padtype="even", padlen=min(n - 1, 27))
     emg_w -= emg_w.mean(axis=0)
     imu_w -= imu_w.mean(axis=0)
-    return emg_w, imu_w, len(rows)
+    return emg_w, imu_w, n
 
 
 class WindowSampler:
@@ -165,6 +164,7 @@ class WindowSampler:
         self.balance = balance
         self.rng = np.random.default_rng(seed)
         self.n_fallback = 0
+        self.n_redrawn = 0      # windows redrawn because they held < MIN_ROWS rows
 
         usable = []
         for r in segments.itertuples(index=False):
@@ -182,6 +182,14 @@ class WindowSampler:
         self.span = [hi - lo for _, lo, hi in usable]
 
     def sample(self) -> Window:
+        for _ in range(100):
+            try:
+                return self._draw()
+            except TooFewRows:
+                self.n_redrawn += 1
+        raise RuntimeError("could not draw a window with enough rows in 100 attempts")
+
+    def _draw(self) -> Window:
         # Draw the length first, identically for every class, then choose only
         # among segments long enough to hold it. Capping the length at each
         # segment's own duration would make rest windows shorter on average.
@@ -216,8 +224,11 @@ def fixed_windows(segments: pd.DataFrame, length: float = 1.2, stride: float = 0
         lo, hi = usable_span(r.label, r.t_start, r.t_end, trims, r)
         t0 = lo
         while t0 + length <= hi + 1e-9:
-            emg, imu, n_raw = make_window(r.t, r.emg, r.imu, r.imu_new, t0, length, fs)
-            out.append(Window(emg, imu, r.label, r.sample_id, r.session, length, t0 - lo, n_raw))
+            try:
+                emg, imu, n_raw = make_window(r.t, r.emg, r.imu, r.imu_new, t0, length, fs)
+                out.append(Window(emg, imu, r.label, r.sample_id, r.session, length, t0 - lo, n_raw))
+            except TooFewRows:
+                pass                                  # too few rows: skipped (see MIN_ROWS)
             t0 += stride
     return out
 
@@ -233,7 +244,7 @@ def test_windows(test_df: pd.DataFrame, fs: float = 250.0) -> list[tuple[str, np
         t = a["t"].to_numpy(dtype=float)
         length = t[-1] - t[0] + 1e-6
         emg, imu, _ = make_window(t, a[EMG_COLS].to_numpy(float), a[IMU_COLS].to_numpy(float),
-                                  a["imu_new"].to_numpy(), t[0], length, fs)
+                                  a["imu_new"].to_numpy(), t[0], length, fs, min_rows=2)
         out.append((aid, emg, imu))
     return out
 
