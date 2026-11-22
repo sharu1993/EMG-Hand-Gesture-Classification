@@ -6,17 +6,18 @@ scripts/baseline.py. Both score every window with a model that never saw its
 session, in the same window order; this script checks that the windows match
 (sample id and offset) before combining.
 
-    python scripts/ensemble.py --auto        # try every TCN x baseline pair in outputs/
+    python scripts/ensemble.py --auto        # every TCN x trees pair, with and without an MLP
     python scripts/ensemble.py --auto --rank-by steady
     python scripts/ensemble.py outputs/tcn_riemann.probs.npz outputs/baseline_riemann_imu_align.probs.npz
 
---auto  pairs every tcn_* file with every baseline_* file in --outdir, scores
-        each equal-weight average, ranks the pairs and reports the best one in
+--auto  pairs every tcn_* file with every baseline_* (trees) file in --outdir,
+        and also tries every such pair plus each mlp_* file (three models).
+        Scores each equal-weight average, ranks them and reports the best in
         detail. Files from an older run whose validation windows differ from
         the newest files (e.g. before a preprocessing change) are skipped. The
-        chosen pair is written to <outdir>/ensemble_choice.json, which
+        chosen combination is written to <outdir>/ensemble_choice.json, which
         scripts/make_submission.py reads to build the submission from the
-        same two models.
+        same models.
 
 --rank-by  balanced (default): mean of the 50 Hz and 60 Hz session scores;
            the test set is about half 50 Hz (test_1, 2, 4) and half 60 Hz
@@ -111,7 +112,8 @@ def combine(probs: list[np.ndarray], weights, geometric: bool) -> np.ndarray:
 
 def model_info(path: Path) -> dict:
     """What it takes to retrain this model: TCN input/alignment from its report
-    (tcn_<run>.json), baseline feature set/alignment from the file name."""
+    (tcn_<run>.json), baseline (trees) / MLP feature set and alignment from the
+    file name."""
     name = path.name.replace(".probs.npz", "")
     if name.startswith("tcn_"):
         report = path.with_name(f"{name}.json")
@@ -122,16 +124,16 @@ def model_info(path: Path) -> dict:
                 "person_aug": args.get("person_aug") == "True",   # absent in older reports: off
                 "extras_default": extras in ({}, {"group_balance": "False", "adversarial": "none"}),
                 "report": report.name if report.exists() else None}
-    slug = name[len("baseline_"):]
+    kind, slug = name.split("_", 1)                     # baseline_<slug> or mlp_<slug>
     align = slug.endswith("_align")
     slug = slug[: -len("_align")] if align else slug
-    return {"kind": "baseline", "name": name, "config": BASELINE_CONFIGS.get(slug), "align": align}
+    return {"kind": kind, "name": name, "config": BASELINE_CONFIGS.get(slug), "align": align}
 
 
 def auto_candidates(outdir: Path):
     """Probability files that share the newest file's validation windows."""
     files = [p for p in sorted(outdir.glob("*.probs.npz"))
-             if p.name.startswith(("tcn_", "baseline_"))]
+             if p.name.startswith(("tcn_", "baseline_", "mlp_"))]
     loaded = {}
     for p in files:
         try:
@@ -148,19 +150,24 @@ def auto_candidates(outdir: Path):
             print(f"skipped {p.name}: scored on different validation windows (older run)")
     tcn = {p: d for p, d in keep.items() if p.name.startswith("tcn_")}
     base = {p: d for p, d in keep.items() if p.name.startswith("baseline_")}
+    mlp = {p: d for p, d in keep.items() if p.name.startswith("mlp_")}
     if not tcn or not base:
         raise SystemExit(f"--auto needs at least one current tcn_* and baseline_* file in {outdir}")
-    return tcn, base
+    return tcn, base, mlp
 
 
-def rank_pairs(tcn: dict, base: dict, rank_key: str) -> pd.DataFrame:
+def rank_combinations(tcn: dict, base: dict, mlp: dict, rank_key: str) -> pd.DataFrame:
+    """Every TCN x trees pair, and every pair plus one MLP; equal weights."""
     rows = []
-    for (pt, dt), (pb, db) in product(tcn.items(), base.items()):
-        s = score(combine([dt["prob_val"], db["prob_val"]], [1, 1], False),
-                  combine([dt["prob_raw"], db["prob_raw"]], [1, 1], False), dt)
+    for (pt, dt), (pb, db), (pm, dm) in product(tcn.items(), base.items(),
+                                               [(None, None)] + list(mlp.items())):
+        ds = [dt, db] + ([dm] if dm is not None else [])
+        s = score(combine([d["prob_val"] for d in ds], [1] * len(ds), False),
+                  combine([d["prob_raw"] for d in ds], [1] * len(ds), False), dt)
         rows.append({"tcn": pt.name.replace(".probs.npz", ""),
-                     "baseline": pb.name.replace(".probs.npz", ""), **s,
-                     "_tcn_path": pt, "_base_path": pb})
+                     "baseline": pb.name.replace(".probs.npz", ""),
+                     "mlp": pm.name.replace(".probs.npz", "") if pm else "-", **s,
+                     "_paths": [pt, pb] + ([pm] if pm else [])})
     return pd.DataFrame(rows).sort_values(rank_key, ascending=False).reset_index(drop=True)
 
 
@@ -180,15 +187,21 @@ def main() -> None:
     rank_key = RANK_KEYS[args.rank_by]
 
     if args.auto:
-        tcn, base = auto_candidates(args.outdir)
-        ranked = rank_pairs(tcn, base, rank_key)
-        show = ranked.drop(columns=["_tcn_path", "_base_path"])
-        print(f"All {len(ranked)} TCN x baseline pairs, equal weights, ranked by {args.rank_by} "
-              f"(sessions held out; best-of-N on the same data is slightly optimistic, "
-              f"pairs within ~0.01 are effectively tied)")
-        print(show.round(3).to_string(index=True))
+        tcn, base, mlp = auto_candidates(args.outdir)
+        ranked = rank_combinations(tcn, base, mlp, rank_key)
+        show = ranked.drop(columns=["_paths"])
+        top = 30
+        print(f"{len(ranked)} combinations (TCN x trees, with and without an MLP), equal weights, "
+              f"ranked by {args.rank_by}; top {min(top, len(ranked))} shown (sessions held out; "
+              f"best-of-N on the same data is slightly optimistic, rows within ~0.01 are "
+              f"effectively tied)")
+        print(show.head(top).round(3).to_string(index=True))
+        pairs_only = ranked[ranked.mlp == "-"]
+        if len(pairs_only) and len(pairs_only) < len(ranked):
+            print(f"best without an MLP: {pairs_only.iloc[0]['tcn']} + {pairs_only.iloc[0]['baseline']} "
+                  f"({args.rank_by} {pairs_only.iloc[0][rank_key]:.3f})")
         best = ranked.iloc[0]
-        paths = [best["_tcn_path"], best["_base_path"]]
+        paths = best["_paths"]
     else:
         paths = args.probs
     if len(paths) < 2:
@@ -229,6 +242,7 @@ def main() -> None:
     if args.auto:
         info = [model_info(Path(p)) for p in paths]
         choice = {"rank_by": args.rank_by, "tcn": info[0], "baseline": info[1],
+                  "mlp": info[2] if len(info) > 2 else None,
                   "scores": {k: round(float(v), 4) for k, v in combo.items() if k != "model"}}
         problems = []
         if info[0].get("input") is None:
@@ -236,15 +250,18 @@ def main() -> None:
         if not info[0].get("extras_default", True):
             problems.append(f"{info[0]['name']} used --group-balance/--adversarial, which "
                             f"make_submission.py does not reproduce")
-        if info[1].get("config") is None:
-            problems.append(f"unknown baseline feature set in {info[1]['name']}")
+        for i in info[1:]:
+            if i.get("config") is None:
+                problems.append(f"unknown feature set in {i['name']}")
         choice["usable_for_submission"] = not problems
         choice["problems"] = problems
         path = args.outdir / "ensemble_choice.json"
         path.write_text(json.dumps(choice, indent=1, default=str))
         print(f"saved {path}: TCN {info[0]['name']} (input {info[0].get('input')}, "
               f"align {info[0].get('align')}, person aug {info[0].get('person_aug')}) + baseline {info[1]['name']} "
-              f"({info[1].get('config')}, align {info[1].get('align')})")
+              f"({info[1].get('config')}, align {info[1].get('align')})"
+              + (f" + MLP {info[2]['name']} ({info[2].get('config')}, align {info[2].get('align')})"
+                 if len(info) > 2 else ""))
         for p in problems:
             print(f"WARNING: {p}; make_submission.py will fall back to its default pair")
 

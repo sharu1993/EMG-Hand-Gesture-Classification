@@ -7,6 +7,8 @@
 
     python scripts/run_all.py              # full run (~1 hour on Apple-silicon MPS)
     python scripts/run_all.py --seeds 3    # average 3 TCN seeds per fold (~3x the TCN time)
+    python scripts/run_all.py --skip-tcn   # baseline + ensemble only, reusing the TCN results
+                                           # already in outputs/ (same windows required)
     python scripts/run_all.py --quick      # tiny settings, ~3 min: checks that everything runs
 
 Each step runs in its own Python process (scikit-learn and PyTorch must not
@@ -54,6 +56,8 @@ def main() -> None:
     ap.add_argument("--quick", action="store_true", help="tiny settings to check the pipeline runs")
     ap.add_argument("--device", default="mps", help="passed to the TCN step (mps, cuda or cpu)")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--skip-tcn", action="store_true",
+                    help="skip the TCN sweep and reuse the tcn_* results in --outdir")
     ap.add_argument("--seeds", type=int, default=1,
                     help="TCN models per fold, averaged (the submission uses 3 regardless)")
     ap.add_argument("--outdir", type=Path, default=Path("outputs"))
@@ -72,6 +76,8 @@ def main() -> None:
                            *(QUICK["tcn"] if args.quick else [])]),
         ("3/3 ensemble", [py, "scripts/ensemble.py", "--auto", "--outdir", str(outdir)]),
     ]
+    if args.skip_tcn:
+        steps = [st for st in steps if "TCN" not in st[0]]
     t0 = time.time()
     with open(outdir / "run_all.log", "w") as log:
         log.write(f"python {py}\nquick {args.quick}\n")

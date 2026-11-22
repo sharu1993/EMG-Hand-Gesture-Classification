@@ -3,8 +3,9 @@
     python scripts/make_submission.py            # ~3-5 min on Apple-silicon MPS
     python scripts/make_submission.py --retrain  # retrain the TCN even if a checkpoint exists
 
-Which two models: the pair that `ensemble.py --auto` ranked best in
-cross-validation (outputs/ensemble_choice.json, written by scripts/run_all.py).
+Which models: the combination that `ensemble.py --auto` ranked best in
+cross-validation (outputs/ensemble_choice.json, written by scripts/run_all.py):
+a TCN and a gradient-boosted tree baseline, plus an MLP when that ranked best.
 Without that file, or with --default-pair, the Riemann TCN with aligned
 windows + the Riemann + IMU feature baseline with aligned windows.
 
@@ -17,7 +18,8 @@ Steps (each in its own process: scikit-learn and PyTorch must not share one on m
   2. TCN probabilities for the 348 test actions   (predict_test.py --model tcn)
   3. train the chosen feature baseline on all sessions and score the test
      actions                                         (predict_test.py --model baseline)
-  4. average the two models' probabilities with equal weights and write
+  3b. the same for the MLP, if the choice includes one (--learner mlp)
+  4. average the models' probabilities with equal weights and write
      outputs/submission.csv in sample_submission.csv's order and columns
 
 The submission is checked before it is written: every test action exactly
@@ -86,12 +88,15 @@ def main() -> None:
     py, t0 = sys.executable, time.time()
     tcn_input, tcn_align, base_config, base_align = DEFAULT_PAIR
     person_aug = DEFAULT_PERSON_AUG
+    mlp_choice = None                                   # (feature set, aligned) or None
     if not args.default_pair and args.choice.exists():
         choice = json.loads(args.choice.read_text())
         if choice.get("usable_for_submission"):
             tcn_input, tcn_align = choice["tcn"]["input"], bool(choice["tcn"]["align"])
             person_aug = bool(choice["tcn"].get("person_aug", False))
             base_config, base_align = choice["baseline"]["config"], bool(choice["baseline"]["align"])
+            if choice.get("mlp"):
+                mlp_choice = (choice["mlp"]["config"], bool(choice["mlp"]["align"]))
             sc = choice.get("scores", {})
             print(f"using the pair from {args.choice.name} (ranked by {choice.get('rank_by')}): "
                   f"cross-validated balanced {sc.get('balanced')}, steady {sc.get('steady_F1')}, "
@@ -103,7 +108,8 @@ def main() -> None:
         print("using the default pair" + ("" if args.default_pair else
               f" ({args.choice.name} not found; run scripts/run_all.py to create it)"))
     print(f"  TCN: input {tcn_input}, align {tcn_align}, person aug {person_aug}, "
-          f"{args.tcn_seeds} seed(s) | baseline: {base_config}, align {base_align}")
+          f"{args.tcn_seeds} seed(s) | baseline: {base_config}, align {base_align}"
+          + (f" | MLP: {mlp_choice[0]}, align {mlp_choice[1]}" if mlp_choice else ""))
     if args.checkpoint is None:
         args.checkpoint = ROOT / (f"models/aura_tcn_{tcn_input}{'_align' if tcn_align else ''}"
                                   f"{'_pa' if person_aug else ''}.pt")
@@ -130,18 +136,26 @@ def main() -> None:
          "--baseline-config", base_config,
          "--baseline-align" if base_align else "--no-baseline-align",
          *workers, *quick_base])
+    mlp_probs = ROOT / "outputs/test_probs_mlp.npz"
+    if mlp_choice:
+        run("3b/3 MLP training + test predictions",
+            [py, "scripts/predict_test.py", "--model", "baseline", "--learner", "mlp",
+             "--out", str(mlp_probs), "--baseline-config", mlp_choice[0],
+             "--baseline-align" if mlp_choice[1] else "--no-baseline-align",
+             *workers, *quick_base])
 
     # combine with equal weights and write in the sample submission's order
     sample = pd.read_csv(args.sample)
     id_col, label_col = sample.columns[:2]
     tcn, base = load_probs(tcn_probs), load_probs(base_probs)
+    models = [tcn, base] + ([load_probs(mlp_probs)] if mlp_choice else [])
     ids = sample[id_col].astype(str)
-    missing = set(ids) - set(tcn.index) | set(ids) - set(base.index)
-    extra = (set(tcn.index) | set(base.index)) - set(ids)
+    missing = set().union(*(set(ids) - set(m.index) for m in models))
+    extra = set().union(*(set(m.index) for m in models)) - set(ids)
     if missing or extra:
         raise SystemExit(f"ids differ from {args.sample.name}: missing {sorted(missing)[:5]}, "
                          f"extra {sorted(extra)[:5]}")
-    probs = (tcn.loc[ids].to_numpy() + base.loc[ids].to_numpy()) / 2
+    probs = sum(m.loc[ids].to_numpy() for m in models) / len(models)
     sub = pd.DataFrame({id_col: ids.to_numpy(), label_col: np.array(LABELS)[probs.argmax(1)]})
 
     assert len(sub) == len(sample) and sub[id_col].is_unique

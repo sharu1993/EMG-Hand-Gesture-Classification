@@ -4,7 +4,8 @@
     python scripts/predict_test.py --model tcn          # needs models/aura_tcn_riemann_align.pt
 
 --model baseline  trains a feature baseline (default: Riemann + IMU features,
-                  aligned training windows; --baseline-config / --no-baseline-align)
+                  aligned training windows, gradient-boosted trees;
+                  --baseline-config / --no-baseline-align / --learner mlp)
                   on all 28 training sessions, then scores the test actions.
 --model tcn       loads a checkpoint written by `train_tcn.py --final` and
                   scores the test actions with it, averaging the probabilities
@@ -51,7 +52,7 @@ from emg_gestures.testset import load_test_actions  # noqa: E402
 
 def predict_baseline(actions, args) -> np.ndarray:
     import pandas as pd
-    from baseline import CONFIGS, META, feature_table, new_model  # scripts/baseline.py
+    from baseline import CONFIGS, LEARNERS, META, feature_table  # scripts/baseline.py
     from emg_gestures.align import align_segments
     from emg_gestures.features import window_features
     from emg_gestures.segments import load_segments
@@ -69,10 +70,10 @@ def predict_baseline(actions, args) -> np.ndarray:
     train = feature_table(train_w, args.workers)
     keep = CONFIGS[args.baseline_config]
     cols = [c for c in train.columns if c not in META and keep(c)]
-    clf = new_model(args.seed).fit(train[cols], train.label)
+    clf = LEARNERS[args.learner](args.seed).fit(train[cols], train.label)
     test = pd.DataFrame([window_features(e, i, riemann=True, corr=True) for _, e, i in actions])
     order = [list(clf.classes_).index(lab) for lab in LABELS]
-    print(f"baseline '{args.baseline_config}' (align {args.baseline_align}): {len(cols)} features, "
+    print(f"baseline '{args.baseline_config}' ({args.learner}, align {args.baseline_align}): {len(cols)} features, "
           f"{len(train)} training windows")
     return clf.predict_proba(test[cols])[:, order]
 
@@ -127,6 +128,8 @@ def main() -> None:
     ap.add_argument("--segments", type=Path, default=ROOT / "data/train_segments.npz")
     ap.add_argument("--checkpoint", type=Path, default=ROOT / "models/aura_tcn_riemann_align.pt")
     ap.add_argument("--baseline-config", default="Riemann + IMU")
+    ap.add_argument("--learner", choices=["hgb", "mlp"], default="hgb",
+                    help="--model baseline: gradient-boosted trees (default) or the MLP")
     ap.add_argument("--baseline-align", action=argparse.BooleanOptionalAction, default=True,
                     help="train the baseline on aligned windows (default) or fixed trims")
     ap.add_argument("--per-session", type=int, default=300)

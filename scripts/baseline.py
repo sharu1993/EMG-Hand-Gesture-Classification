@@ -11,9 +11,15 @@ Validation windows: fixed 1.2 s windows (stride 0.5 s) from the steady part
 Also reported: the same models on untrimmed 1.4 s windows (test-like, they may
 include transitions), and scores per recording setup (50 Hz vs 60 Hz mains).
 
+Two learners per feature set: gradient-boosted trees, and a small neural
+network (MLP, one hidden layer of 128 units, on standardised features). The MLP
+is weaker alone but makes different mistakes, which helps the ensemble
+(scripts/ensemble.py), mainly on the 60 Hz sessions. --no-mlp skips it.
+
 Every configuration saves its cross-validated class probabilities to
-outputs/baseline_<name>.probs.npz, in the same format and window order as
-scripts/train_tcn.py, for scripts/ensemble.py.
+outputs/baseline_<name>.probs.npz (trees) and outputs/mlp_<name>.probs.npz
+(MLP), in the same format and window order as scripts/train_tcn.py, for
+scripts/ensemble.py.
 
     python scripts/baseline.py                       # data/train_segments.npz
     python scripts/baseline.py --align
@@ -33,6 +39,9 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import confusion_matrix, f1_score
 from sklearn.model_selection import GroupKFold
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from emg_gestures.align import align_segments  # noqa: E402
@@ -81,7 +90,18 @@ def new_model(seed: int) -> HistGradientBoostingClassifier:
                                           l2_regularization=1.0, random_state=seed)
 
 
-def run_cv(train: pd.DataFrame, tables: dict, cols, folds: int, seed: int):
+def new_mlp(seed: int):
+    """One hidden layer of 128 units on standardised features; strong L2
+    (alpha 0.1) and early stopping on a 10% split of the training windows."""
+    return make_pipeline(StandardScaler(),
+                         MLPClassifier((128,), alpha=0.1, early_stopping=True, max_iter=300,
+                                       random_state=seed))
+
+
+LEARNERS = {"hgb": new_model, "mlp": new_mlp}
+
+
+def run_cv(train: pd.DataFrame, tables: dict, cols, folds: int, seed: int, learner: str = "hgb"):
     """Session-held-out CV. Returns class probabilities (columns in LABELS
     order) for every table in ``tables`` and the per-fold macro F1 on the first."""
     sessions = np.array(sorted(train.session.unique()))
@@ -91,7 +111,7 @@ def run_cv(train: pd.DataFrame, tables: dict, cols, folds: int, seed: int):
     for _, te in GroupKFold(n_splits=folds).split(sessions, groups=sessions):
         held = set(sessions[te])
         tr = train[~train.session.isin(held)]
-        clf = new_model(seed).fit(tr[cols], tr.label)
+        clf = LEARNERS[learner](seed).fit(tr[cols], tr.label)
         order = [list(clf.classes_).index(lab) for lab in LABELS]   # sklearn sorts class names
         for k, t in tables.items():
             m = t.session.isin(held).to_numpy()
@@ -125,6 +145,8 @@ def main() -> None:
     ap.add_argument("--align", action="store_true",
                     help="training windows from per-segment aligned spans (emg_gestures/align.py)")
     ap.add_argument("--ablations", action="store_true", help="also run single-group feature sets")
+    ap.add_argument("--mlp", action=argparse.BooleanOptionalAction, default=True,
+                    help="also cross-validate the MLP on each main feature set (default on)")
     ap.add_argument("--outdir", type=Path, default=Path("outputs"))
     args = ap.parse_args()
     configs = {**CONFIGS, **(ABLATIONS if args.ablations else {})}
@@ -152,27 +174,31 @@ def main() -> None:
         return round(f1_score(df.label[m], pred[m], average="macro"), 3)
 
     results, best = [], None
-    for name, keep in configs.items():
+    jobs = [(name, keep, "hgb") for name, keep in configs.items()]
+    if args.mlp:
+        jobs += [(name, keep, "mlp") for name, keep in CONFIGS.items()]
+    for name, keep, learner in jobs:
         cols = [c for c in train.columns if c not in META and keep(c)]
-        probs, fold_f1 = run_cv(train, {"val": val, "raw": raw}, cols, args.folds, args.seed)
+        probs, fold_f1 = run_cv(train, {"val": val, "raw": raw}, cols, args.folds, args.seed, learner)
         pred = np.array(LABELS)[probs["val"].argmax(1)]
         pred_raw = np.array(LABELS)[probs["raw"].argmax(1)]
         f1 = f1_score(val.label, pred, average="macro")
-        results.append((name, len(cols), round(f1, 3), round(fold_f1.std(), 3),
+        results.append((name, learner, len(cols), round(f1, 3), round(fold_f1.std(), 3),
                         group_f1(val, pred, False), group_f1(val, pred, True),
                         round(f1_score(raw.label, pred_raw, average="macro"), 3)))
         slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
-        save_probs(args.outdir / f"baseline_{slug}{'_align' if args.align else ''}.probs.npz",
+        prefix = "baseline" if learner == "hgb" else "mlp"
+        save_probs(args.outdir / f"{prefix}_{slug}{'_align' if args.align else ''}.probs.npz",
                    val, raw, probs["val"], probs["raw"])
         if best is None or f1 > best[1]:
-            best = (name, f1, pred, cols)
+            best = (f"{name} ({learner})", f1, pred, cols)
 
     chance = 1 / len(LABELS)
     print(f"\nMacro F1, sessions held out ({args.folds} folds). Chance ~{chance:.2f}")
-    print(pd.DataFrame(results, columns=["features", "n_feat", "steady_F1", "fold_std",
+    print(pd.DataFrame(results, columns=["features", "learner", "n_feat", "steady_F1", "fold_std",
                                          "50Hz_sessions", "60Hz_sessions",
                                          "untrimmed_1.4s_F1"]).to_string(index=False))
-    print(f"probabilities saved to {args.outdir}/baseline_*.probs.npz")
+    print(f"probabilities saved to {args.outdir}/baseline_*.probs.npz (trees) and mlp_*.probs.npz (MLP)")
 
     name, f1, pred, cols = best
     print(f"\nBest: {name}")
