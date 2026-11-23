@@ -90,12 +90,34 @@ def new_model(seed: int) -> HistGradientBoostingClassifier:
                                           l2_regularization=1.0, random_state=seed)
 
 
-def new_mlp(seed: int):
+class LabelCodedMLP:
     """One hidden layer of 128 units on standardised features; strong L2
-    (alpha 0.1) and early stopping on a 10% split of the training windows."""
-    return make_pipeline(StandardScaler(),
-                         MLPClassifier((128,), alpha=0.1, early_stopping=True, max_iter=300,
-                                       random_state=seed))
+    (alpha 0.1) and early stopping on a 10% split of the training windows.
+
+    Trained on integer class codes: recent scikit-learn releases fail inside
+    MLPClassifier's early stopping when the labels are strings (an isnan check
+    on the predicted labels). ``classes_`` and ``predict_proba`` columns are in
+    sorted label order, as for the other scikit-learn classifiers."""
+
+    def __init__(self, seed: int):
+        self.model = make_pipeline(StandardScaler(),
+                                   MLPClassifier((128,), alpha=0.1, early_stopping=True,
+                                                 max_iter=300, random_state=seed))
+
+    def fit(self, X, y):
+        self.classes_, codes = np.unique(np.asarray(y), return_inverse=True)
+        self.model.fit(X, codes)
+        return self
+
+    def predict_proba(self, X):
+        return self.model.predict_proba(X)
+
+    def predict(self, X):
+        return self.classes_[self.predict_proba(X).argmax(1)]
+
+
+def new_mlp(seed: int) -> LabelCodedMLP:
+    return LabelCodedMLP(seed)
 
 
 LEARNERS = {"hgb": new_model, "mlp": new_mlp}
