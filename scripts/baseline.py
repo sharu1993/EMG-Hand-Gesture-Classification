@@ -16,6 +16,11 @@ network (MLP, one hidden layer of 128 units, on standardised features). The MLP
 is weaker alone but makes different mistakes, which helps the ensemble
 (scripts/ensemble.py), mainly on the 60 Hz sessions. --no-mlp skips it.
 
+--shift-aug small|wide adds one copy of every training window with the electrode
+patch shifted, as if the band were worn rotated (small: up to one row; wide: up to
+two rows or the band reversed; emg_gestures/augment.py). Validation windows are
+never shifted. Output files then end in _shift<level>.
+
 Every configuration saves its cross-validated class probabilities to
 outputs/baseline_<name>.probs.npz (trees) and outputs/mlp_<name>.probs.npz
 (MLP), in the same format and window order as scripts/train_tcn.py, for
@@ -45,6 +50,7 @@ from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from emg_gestures.align import align_segments  # noqa: E402
+from emg_gestures.augment import SHIFT_LEVELS, patch_shift, random_patch_shift  # noqa: E402
 from emg_gestures.features import window_features  # noqa: E402
 from emg_gestures.segments import LABELS, load_segments  # noqa: E402
 from emg_gestures.windows import (ALIGNED, NO_TRIM, STEADY_STATE, WindowSampler,  # noqa: E402
@@ -72,16 +78,26 @@ ABLATIONS = {
 }
 
 
-def _feats(w):
-    f = window_features(w.emg, w.imu, riemann=True, corr=True)  # IMU already low-passed in make_window
+def _feats(job):
+    """job: a window, or (window, patch shift, seed) for a shifted training copy."""
+    w, shift, seed = job if isinstance(job, tuple) else (job, None, 0)
+    emg = w.emg if shift is None else patch_shift(w.emg, shift, np.random.default_rng(seed))
+    f = window_features(emg, w.imu, riemann=True, corr=True)  # IMU already low-passed in make_window
     f.update(label=w.label, session=w.session, length_s=w.length_s, offset_s=w.offset_s,
              sample_id=w.sample_id)
     return f
 
 
-def feature_table(windows, workers: int) -> pd.DataFrame:
+def feature_table(windows, workers: int, shift_level: str = "none", seed: int = 0) -> pd.DataFrame:
+    """Features of ``windows``; with a shift level, plus one patch-shifted copy of each
+    window (shift drawn per window from SHIFT_LEVELS[shift_level])."""
+    jobs = list(windows)
+    if shift_level != "none":
+        rng = np.random.default_rng(seed + 7919)
+        jobs += [(w, random_patch_shift(shift_level, rng), seed * 1_000_003 + k)
+                 for k, w in enumerate(windows)]
     with ProcessPoolExecutor(workers) as ex:
-        rows = list(ex.map(_feats, windows, chunksize=64))
+        rows = list(ex.map(_feats, jobs, chunksize=64))
     return pd.DataFrame(rows)
 
 
@@ -169,6 +185,8 @@ def main() -> None:
     ap.add_argument("--ablations", action="store_true", help="also run single-group feature sets")
     ap.add_argument("--mlp", action=argparse.BooleanOptionalAction, default=True,
                     help="also cross-validate the MLP on each main feature set (default on)")
+    ap.add_argument("--shift-aug", choices=list(SHIFT_LEVELS), default="none",
+                    help="add patch-shifted copies of the training windows (default none)")
     ap.add_argument("--outdir", type=Path, default=Path("outputs"))
     args = ap.parse_args()
     configs = {**CONFIGS, **(ABLATIONS if args.ablations else {})}
@@ -186,7 +204,10 @@ def main() -> None:
     print(f"{len(train_w)} training windows (align {args.align}), {len(val_w)} steady validation "
           f"windows, {len(raw_w)} untrimmed 1.4 s windows, {segs.session.nunique()} sessions")
 
-    train = feature_table(train_w, args.workers)
+    train = feature_table(train_w, args.workers, args.shift_aug, args.seed)
+    if args.shift_aug != "none":
+        print(f"shift augmentation '{args.shift_aug}': {len(train)} training rows "
+              f"({len(train_w)} as worn + {len(train) - len(train_w)} shifted)")
     val = feature_table(val_w, args.workers)
     raw = feature_table(raw_w, args.workers)
     print(f"features: {time.time() - t0:.0f} s")
@@ -210,7 +231,8 @@ def main() -> None:
                         round(f1_score(raw.label, pred_raw, average="macro"), 3)))
         slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
         prefix = "baseline" if learner == "hgb" else "mlp"
-        save_probs(args.outdir / f"{prefix}_{slug}{'_align' if args.align else ''}.probs.npz",
+        suffix = ("_align" if args.align else "") + ("" if args.shift_aug == "none" else f"_shift{args.shift_aug}")
+        save_probs(args.outdir / f"{prefix}_{slug}{suffix}.probs.npz",
                    val, raw, probs["val"], probs["raw"])
         if best is None or f1 > best[1]:
             best = (f"{name} ({learner})", f1, pred, cols)

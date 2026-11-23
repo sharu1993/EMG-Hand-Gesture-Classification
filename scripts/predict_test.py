@@ -67,13 +67,14 @@ def predict_baseline(actions, args) -> np.ndarray:
     for s, g in segs.groupby("session"):
         train_w += WindowSampler(g, trims=ALIGNED if args.baseline_align else STEADY_STATE,
                                  seed=args.seed * 1000 + s).sample_many(args.per_session)
-    train = feature_table(train_w, args.workers)
+    train = feature_table(train_w, args.workers, args.shift_aug, args.seed)
     keep = CONFIGS[args.baseline_config]
     cols = [c for c in train.columns if c not in META and keep(c)]
     clf = LEARNERS[args.learner](args.seed).fit(train[cols], train.label)
     test = pd.DataFrame([window_features(e, i, riemann=True, corr=True) for _, e, i in actions])
     order = [list(clf.classes_).index(lab) for lab in LABELS]
-    print(f"baseline '{args.baseline_config}' ({args.learner}, align {args.baseline_align}): {len(cols)} features, "
+    print(f"baseline '{args.baseline_config}' ({args.learner}, align {args.baseline_align}, "
+          f"shift aug {args.shift_aug}): {len(cols)} features, "
           f"{len(train)} training windows")
     return clf.predict_proba(test[cols])[:, order]
 
@@ -133,6 +134,8 @@ def main() -> None:
     ap.add_argument("--baseline-align", action=argparse.BooleanOptionalAction, default=True,
                     help="train the baseline on aligned windows (default) or fixed trims")
     ap.add_argument("--per-session", type=int, default=300)
+    ap.add_argument("--shift-aug", choices=["none", "small", "wide"], default="none",
+                    help="--model baseline: patch-shift augmentation level of the training windows")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=Path, default=None)

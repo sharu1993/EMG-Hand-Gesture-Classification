@@ -19,6 +19,11 @@ session, in the same window order; this script checks that the windows match
         scripts/make_submission.py reads to build the submission from the
         same models.
 
+--shift-aug none|small|wide|any
+        --auto only: consider only models trained with this patch-shift
+        augmentation level (default none), so augmented and plain models are
+        never mixed in one ensemble. "any" disables the filter.
+
 --rank-by  balanced (default): mean of the 50 Hz and 60 Hz session scores;
            the test set is about half 50 Hz (test_1, 2, 4) and half 60 Hz
            (test_3, 5), so this matches it better than the overall score,
@@ -121,19 +126,28 @@ def model_info(path: Path) -> dict:
         extras = {k: args.get(k) for k in ("group_balance", "adversarial") if k in args}
         return {"kind": "tcn", "name": name, "input": args.get("input"),
                 "align": args.get("align") == "True",
+                "shift_aug": args.get("shift_aug", "none"),         # absent in older reports: none
                 "person_aug": args.get("person_aug") == "True",   # absent in older reports: off
                 "extras_default": extras in ({}, {"group_balance": "False", "adversarial": "none"}),
                 "report": report.name if report.exists() else None}
-    kind, slug = name.split("_", 1)                     # baseline_<slug> or mlp_<slug>
+    kind, slug = name.split("_", 1)                     # baseline_<slug>[_align][_shift<level>]
+    shift = "none"
+    for level in ("small", "wide"):
+        if slug.endswith(f"_shift{level}"):
+            shift, slug = level, slug[: -len(f"_shift{level}")]
     align = slug.endswith("_align")
     slug = slug[: -len("_align")] if align else slug
-    return {"kind": kind, "name": name, "config": BASELINE_CONFIGS.get(slug), "align": align}
+    return {"kind": kind, "name": name, "config": BASELINE_CONFIGS.get(slug), "align": align,
+            "shift_aug": shift}
 
 
-def auto_candidates(outdir: Path):
-    """Probability files that share the newest file's validation windows."""
+def auto_candidates(outdir: Path, shift_aug: str = "none"):
+    """Probability files that share the newest file's validation windows (and, unless
+    shift_aug is "any", were trained with that patch-shift augmentation level)."""
     files = [p for p in sorted(outdir.glob("*.probs.npz"))
              if p.name.startswith(("tcn_", "baseline_", "mlp_"))]
+    if shift_aug != "any":
+        files = [p for p in files if model_info(p).get("shift_aug", "none") == shift_aug]
     loaded = {}
     for p in files:
         try:
@@ -183,11 +197,13 @@ def main() -> None:
     ap.add_argument("--geometric", action="store_true",
                     help="average log-probabilities instead of probabilities")
     ap.add_argument("--outdir", type=Path, default=Path("outputs"))
+    ap.add_argument("--shift-aug", choices=["none", "small", "wide", "any"], default="none",
+                    help="--auto: only models trained with this shift augmentation level")
     args = ap.parse_args()
     rank_key = RANK_KEYS[args.rank_by]
 
     if args.auto:
-        tcn, base, mlp = auto_candidates(args.outdir)
+        tcn, base, mlp = auto_candidates(args.outdir, args.shift_aug)
         ranked = rank_combinations(tcn, base, mlp, rank_key)
         show = ranked.drop(columns=["_paths"])
         top = 30

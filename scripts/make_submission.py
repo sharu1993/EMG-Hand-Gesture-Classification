@@ -22,6 +22,12 @@ Steps (each in its own process: scikit-learn and PyTorch must not share one on m
   4. average the models' probabilities with equal weights and write
      outputs/submission.csv in sample_submission.csv's order and columns
 
+--shift-aug small|wide builds the submission from models trained with patch-shift
+augmentation (band worn rotated or reversed; emg_gestures/augment.py): it reads
+outputs_shift<level>/ensemble_choice.json (written by `run_all.py --shift-aug
+<level>`), trains every model with that level, uses checkpoint names ending in
+_shift<level>, and writes outputs_shift<level>/submission.csv.
+
 The submission is checked before it is written: every test action exactly
 once, no extra ids, labels from the training set only.
 """
@@ -74,16 +80,23 @@ def main() -> None:
                     help="TCN models trained with different seeds and averaged (default 3)")
     ap.add_argument("--checkpoint", type=Path, default=None,
                     help="TCN checkpoint (default models/aura_tcn_<input>[_align][_pa].pt)")
-    ap.add_argument("--choice", type=Path, default=ROOT / "outputs/ensemble_choice.json",
-                    help="model pair picked by `ensemble.py --auto` (written by run_all.py)")
+    ap.add_argument("--shift-aug", choices=["none", "small", "wide"], default="none",
+                    help="patch-shift augmentation level of all models (default none)")
+    ap.add_argument("--choice", type=Path, default=None,
+                    help="default outputs[_shift<level>]/ensemble_choice.json")
     ap.add_argument("--default-pair", action="store_true",
                     help="ignore --choice and use the default pair (Riemann TCN with "
                          "alignment + Riemann + IMU baseline with alignment)")
     ap.add_argument("--sample", type=Path, default=DATA / "sample_submission.csv")
-    ap.add_argument("--out", type=Path, default=ROOT / "outputs/submission.csv")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="default outputs[_shift<level>]/submission.csv")
     ap.add_argument("--quick", action="store_true",
                     help="tiny training settings to check the pipeline runs (not a real submission)")
     args = ap.parse_args()
+    outdir = ROOT / ("outputs" if args.shift_aug == "none" else f"outputs_shift{args.shift_aug}")
+    args.choice = args.choice or outdir / "ensemble_choice.json"
+    args.out = args.out or outdir / "submission.csv"
+    shift = ["--shift-aug", args.shift_aug]
 
     py, t0 = sys.executable, time.time()
     tcn_input, tcn_align, base_config, base_align = DEFAULT_PAIR
@@ -93,6 +106,11 @@ def main() -> None:
         choice = json.loads(args.choice.read_text())
         if choice.get("usable_for_submission"):
             tcn_input, tcn_align = choice["tcn"]["input"], bool(choice["tcn"]["align"])
+            levels = {m.get("shift_aug", "none") for m in (choice["tcn"], choice["baseline"], choice.get("mlp"))
+                      if m}
+            if levels != {args.shift_aug}:
+                raise SystemExit(f"{args.choice} holds models with shift augmentation {sorted(levels)}, "
+                                 f"but --shift-aug is {args.shift_aug}")
             person_aug = bool(choice["tcn"].get("person_aug", False))
             base_config, base_align = choice["baseline"]["config"], bool(choice["baseline"]["align"])
             if choice.get("mlp"):
@@ -112,7 +130,8 @@ def main() -> None:
           + (f" | MLP: {mlp_choice[0]}, align {mlp_choice[1]}" if mlp_choice else ""))
     if args.checkpoint is None:
         args.checkpoint = ROOT / (f"models/aura_tcn_{tcn_input}{'_align' if tcn_align else ''}"
-                                  f"{'_pa' if person_aug else ''}.pt")
+                                  f"{'_pa' if person_aug else ''}"
+                                  f"{'' if args.shift_aug == 'none' else '_shift' + args.shift_aug}.pt")
     quick_tcn = ["--per-session", "20", "--epochs", "1"] if args.quick else []
     seeds = ["--seeds", "1" if args.quick else str(args.tcn_seeds)]
     quick_base = ["--per-session", "20"] if args.quick else []
@@ -122,12 +141,13 @@ def main() -> None:
         run("1/3 train TCN on all sessions",
             [py, "scripts/train_tcn.py", "--final", "--input", tcn_input,
              *(["--align"] if tcn_align else []),
-             "--person-aug" if person_aug else "--no-person-aug", *seeds,
+             "--person-aug" if person_aug else "--no-person-aug", *seeds, *shift,
              "--device", args.device, "--out", str(args.checkpoint), *workers, *quick_tcn])
     else:
         print(f"using existing checkpoint {args.checkpoint} (pass --retrain to rebuild it)")
-    tcn_probs = ROOT / "outputs/test_probs_tcn.npz"
-    base_probs = ROOT / "outputs/test_probs_baseline.npz"
+    outdir.mkdir(parents=True, exist_ok=True)
+    tcn_probs = outdir / "test_probs_tcn.npz"
+    base_probs = outdir / "test_probs_baseline.npz"
     run("2/3 TCN test predictions",
         [py, "scripts/predict_test.py", "--model", "tcn", "--checkpoint", str(args.checkpoint),
          "--out", str(tcn_probs)])
@@ -135,14 +155,14 @@ def main() -> None:
         [py, "scripts/predict_test.py", "--model", "baseline", "--out", str(base_probs),
          "--baseline-config", base_config,
          "--baseline-align" if base_align else "--no-baseline-align",
-         *workers, *quick_base])
-    mlp_probs = ROOT / "outputs/test_probs_mlp.npz"
+         *shift, *workers, *quick_base])
+    mlp_probs = outdir / "test_probs_mlp.npz"
     if mlp_choice:
         run("3b/3 MLP training + test predictions",
             [py, "scripts/predict_test.py", "--model", "baseline", "--learner", "mlp",
              "--out", str(mlp_probs), "--baseline-config", mlp_choice[0],
              "--baseline-align" if mlp_choice[1] else "--no-baseline-align",
-             *workers, *quick_base])
+             *shift, *workers, *quick_base])
 
     # combine with equal weights and write in the sample submission's order
     sample = pd.read_csv(args.sample)

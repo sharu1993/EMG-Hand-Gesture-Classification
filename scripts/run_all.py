@@ -7,6 +7,8 @@
 
     python scripts/run_all.py              # full run (~1 hour on Apple-silicon MPS)
     python scripts/run_all.py --seeds 3    # average 3 TCN seeds per fold (~3x the TCN time)
+    python scripts/run_all.py --shift-aug wide   # train every model with patch-shift augmentation;
+                                                 # results go to outputs_shiftwide/ by default
     python scripts/run_all.py --skip-tcn   # baseline + ensemble only, reusing the TCN results
                                            # already in outputs/ (same windows required)
     python scripts/run_all.py --quick      # tiny settings, ~3 min: checks that everything runs
@@ -60,21 +62,27 @@ def main() -> None:
                     help="skip the TCN sweep and reuse the tcn_* results in --outdir")
     ap.add_argument("--seeds", type=int, default=1,
                     help="TCN models per fold, averaged (the submission uses 3 regardless)")
-    ap.add_argument("--outdir", type=Path, default=Path("outputs"))
+    ap.add_argument("--shift-aug", choices=["none", "small", "wide"], default="none",
+                    help="patch-shift augmentation for all models (default none)")
+    ap.add_argument("--outdir", type=Path, default=None,
+                    help="default outputs/, or outputs_shift<level>/ with --shift-aug")
     args = ap.parse_args()
 
     py = sys.executable
+    if args.outdir is None:
+        args.outdir = Path("outputs" if args.shift_aug == "none" else f"outputs_shift{args.shift_aug}")
     outdir = args.outdir if args.outdir.is_absolute() else ROOT / args.outdir
+    shift = ["--shift-aug", args.shift_aug]
     outdir.mkdir(parents=True, exist_ok=True)
     workers = ["--workers", str(args.workers)]
     steps = [
         ("1/3 feature baseline", [py, "scripts/baseline.py", "--align", "--outdir", str(outdir),
-                                   *workers, *(QUICK["baseline"] if args.quick else [])]),
+                                   *shift, *workers, *(QUICK["baseline"] if args.quick else [])]),
         ("2/3 TCN sweep", [py, "scripts/train_tcn.py", "--sweep", "--device", args.device,
                            "--report", str(outdir / "tcn_cv.json"), "--seeds", str(args.seeds),
-                           *workers,
+                           *shift, *workers,
                            *(QUICK["tcn"] if args.quick else [])]),
-        ("3/3 ensemble", [py, "scripts/ensemble.py", "--auto", "--outdir", str(outdir)]),
+        ("3/3 ensemble", [py, "scripts/ensemble.py", "--auto", "--outdir", str(outdir), *shift]),
     ]
     if args.skip_tcn:
         steps = [st for st in steps if "TCN" not in st[0]]

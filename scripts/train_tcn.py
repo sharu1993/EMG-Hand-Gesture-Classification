@@ -28,6 +28,11 @@ warping, sensor noise, and 0-3 dropped channels per window.
 background noise mixed in (weaker gesture contrast) and a random spectral tilt
 (different tissue filtering), see emg_gestures/augment.py.
 
+--shift-aug small|wide
+             for the riemann inputs: half of the training windows get the electrode
+             patch shifted, as if the band were worn rotated (small: up to one row;
+             wide: up to two rows or the band reversed; emg_gestures/augment.py)
+
 --seeds N    train N models per fold (and N for --final) with different seeds
              and average their probabilities. The --final checkpoint holds all N.
 
@@ -83,7 +88,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from emg_gestures.align import align_segments  # noqa: E402
 from emg_gestures.augment import (DROP_PROBS, GAIN_SD, NOISE_SD, WARP_KNOTS, WARP_SD,  # noqa: E402
                                   augment_emg_signal, augment_imu_signal,
-                                  augment_person_signal)
+                                  augment_person_signal, patch_shift, random_patch_shift)
 from emg_gestures.frames import (BAND_COLS_OF_CHANNEL, CORR_COLS_OF_CHANNEL,  # noqa: E402
                                  EMG_DIM, imu_frames, window_frames)
 from emg_gestures.riemann import riemann_frames  # noqa: E402
@@ -110,6 +115,8 @@ SWEEP = {
     "riemann_corr": {"input": "riemann_corr", "person_aug": False},
     "riemann_corr_pa": {"input": "riemann_corr", "person_aug": True},
 }
+# Share of training windows that get a patch shift when --shift-aug is set.
+SHIFT_PROB = 0.5
 # Seed j of a fold's model ensemble uses seed + fold + SEED_STEP * j.
 SEED_STEP = 100
 
@@ -144,10 +151,12 @@ def _prep(job):
     to the signal here (once per window) instead of on the GPU each epoch.
     ``person_aug`` adds the person-variation augmentation before the usual one.
     """
-    w, kind, aug_seed, person_aug = job
+    w, kind, aug_seed, person_aug, shift_level = job
     e, i = preprocess(w.emg, w.imu)
     if aug_seed is not None:
         rng = np.random.default_rng(aug_seed)
+        if shift_level != "none" and rng.random() < SHIFT_PROB:
+            e = patch_shift(e, random_patch_shift(shift_level, rng), rng)
         if person_aug:
             e = augment_person_signal(e, rng)
         e, i = augment_emg_signal(e, rng), augment_imu_signal(i, rng)
@@ -162,9 +171,10 @@ class Pool:
     """All windows of one kind, padded once and kept on the device."""
 
     def __init__(self, windows, kind: str, device: torch.device, workers: int,
-                 augment_seed: int | None = None, person_aug: bool = False):
-        jobs = [(w, kind, None if augment_seed is None else augment_seed * 1_000_003 + k, person_aug)
-                for k, w in enumerate(windows)]
+                 augment_seed: int | None = None, person_aug: bool = False,
+                 shift_level: str = "none"):
+        jobs = [(w, kind, None if augment_seed is None else augment_seed * 1_000_003 + k, person_aug,
+                 shift_level) for k, w in enumerate(windows)]
         with ProcessPoolExecutor(workers) as ex:
             items = list(ex.map(_prep, jobs, chunksize=128))
         n, T = len(items), max(len(it[0]) for it in items)
@@ -396,6 +406,8 @@ def main() -> None:
     ap.add_argument("--person-aug", action=argparse.BooleanOptionalAction, default=False,
                     help="person-variation augmentation (riemann inputs only); the sweep sets "
                          "it per run")
+    ap.add_argument("--shift-aug", choices=["none", "small", "wide"], default="none",
+                    help="patch-shift augmentation for the riemann inputs (default none)")
     ap.add_argument("--seeds", type=int, default=1,
                     help="models per fold (and for --final), averaged; each gets its own seed")
     ap.add_argument("--group-balance", action="store_true",
@@ -418,7 +430,7 @@ def main() -> None:
     data = DataCache(load_segments(args.segments), args, device)
 
     if args.final:
-        train, _, _ = data.pools(args.input, args.align, args.person_aug)
+        train, _, _ = data.pools(args.input, args.align, args.person_aug, args.shift_aug)
         states = []
         for j in range(args.seeds):
             model, std = train_model(train, torch.arange(len(train), device=device), args, device,
@@ -430,6 +442,7 @@ def main() -> None:
         # the standardizer depends only on the training pool, so it is the same for every seed
         torch.save({"state_dict": states[0], "state_dicts": states, "labels": LABELS,
                     "input": args.input, "align": args.align, "person_aug": args.person_aug,
+                    "shift_aug": args.shift_aug,
                     "config": model_config(args), "standardizer": std.state()}, args.out)
         print(f"saved {args.out} ({args.seeds} model(s), {time.time() - t0:.0f} s)")
         return
@@ -440,11 +453,12 @@ def main() -> None:
             run_args = argparse.Namespace(**{**vars(args), **overrides})
             run_args.report = args.report.parent / f"tcn_{name}.json"
             print(f"\n=== {name}: input {run_args.input}, align {run_args.align}, "
-                  f"person aug {run_args.person_aug}, seeds {run_args.seeds}, "
+                  f"person aug {run_args.person_aug}, shift aug {run_args.shift_aug}, seeds {run_args.seeds}, "
                   f"group balance {run_args.group_balance}, adversarial {run_args.adversarial}",
                   flush=True)
             t1 = time.time()
-            train, val, raw = data.pools(run_args.input, run_args.align, run_args.person_aug)
+            train, val, raw = data.pools(run_args.input, run_args.align, run_args.person_aug,
+                                         run_args.shift_aug)
             report = cross_validate(train, val, raw, run_args, device, t0, show_details=False)
             rows.append({"run": name, "steady_F1": report["steady_macro_F1"],
                          "50Hz": report["50Hz_sessions"], "60Hz": report["60Hz_sessions"],
@@ -459,7 +473,7 @@ def main() -> None:
               f"{(time.time() - t0) / 60:.1f} min")
         return
 
-    train, val, raw = data.pools(args.input, args.align, args.person_aug)
+    train, val, raw = data.pools(args.input, args.align, args.person_aug, args.shift_aug)
     cross_validate(train, val, raw, args, device, t0, show_details=True)
 
 
@@ -490,21 +504,26 @@ class DataCache:
             self._train_w[align] = w
         return self._train_w[align]
 
-    def pools(self, kind: str, align: bool, person_aug: bool = False):
+    def pools(self, kind: str, align: bool, person_aug: bool = False, shift_level: str = "none"):
         a, t0 = self.args, time.time()
         person_aug = person_aug and kind in SIGNAL_AUG_KINDS
-        key = ("train", kind, align, person_aug)
+        if shift_level != "none" and kind not in SIGNAL_AUG_KINDS:
+            print(f"WARNING: --shift-aug applies to the riemann inputs only; ignored for {kind}", flush=True)
+            shift_level = "none"
+        key = ("train", kind, align, person_aug, shift_level)
         if ("val", kind) not in self._pools:
             self._pools[("val", kind)] = Pool(self.val_w, kind, self.device, a.workers)
             self._pools[("raw", kind)] = Pool(self.raw_w, kind, self.device, a.workers)
         if key not in self._pools:
             aug_seed = a.seed + 1 if kind in SIGNAL_AUG_KINDS else None   # signal-domain augmentation
             self._pools[key] = Pool(self.train_windows(align), kind, self.device, a.workers,
-                                    augment_seed=aug_seed, person_aug=person_aug)
+                                    augment_seed=aug_seed, person_aug=person_aug,
+                                    shift_level=shift_level)
             cfg_args = argparse.Namespace(**{**vars(a), "input": kind})
             probe = AuraTCN(**model_config(cfg_args))
             unit = "samples" if kind == "raw" else "frames"
             print(f"device {self.device}; input {kind}; align {align}; person aug {person_aug}; "
+                  f"shift aug {shift_level}; "
                   f"{len(self._pools[key])} train / "
                   f"{len(self._pools[('val', kind)])} steady val / "
                   f"{len(self._pools[('raw', kind)])} untrimmed windows; model "

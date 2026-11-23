@@ -99,3 +99,54 @@ def augment_person_signal(emg: np.ndarray, rng: np.random.Generator,
 
 def augment_imu_signal(imu: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     return imu * np.exp(rng.normal(0, 0.1, imu.shape[1])) + rng.normal(0, 0.05, imu.shape)
+
+# ----------------------------------------------------------- band placement shifts
+# Aura electrode patch (PiEEG Aura VR specification, "Bracelet electrode layout",
+# skin-facing view): 2 columns x 5 rows of contacts; rows step around the wrist.
+#   row 0: REF  CH1 | row 1: CH2 CH3 | row 2: CH4 CH5 | row 3: CH6 CH7 | row 4: CH8 BIAS
+# Every channel is measured against REF. A band worn rotated moves the whole patch
+# by rows; a band worn reversed turns it by 180 degrees. ``patch_shift`` simulates:
+#   +1 / +2 rows  exact: every contact reads the skin one/two rows further on, and the
+#                 new reference sits where CH2 / CH4 was, so new = old(row+k) - CH2 / CH4
+#   -1 / -2 rows  approximate: new = old(row-k); the new reference would be off the
+#                 patch, so the old reference is kept
+#   +-0.5 rows    average of the unshifted window and the +-1 row shift
+#   "rev"         approximate: CH1<->CH8, CH2<->CH7, CH3<->CH6, CH4<->CH5 (reference kept)
+# Contacts that move onto skin no electrode recorded become near-silent, like a lost
+# contact. A shift that moves the patch entirely onto unrecorded skin (a large rotation
+# of the band) cannot be simulated from these recordings.
+SHIFT_LEVELS = {
+    "none": (),
+    "small": (-1, -0.5, 0.5, 1),                       # up to one row
+    "wide": (-2, -1, -0.5, 0.5, 1, 2, "rev"),          # up to two rows, and the band reversed
+}
+
+
+def patch_shift(emg: np.ndarray, k, rng: np.random.Generator) -> np.ndarray:
+    """(T, 8) EMG (raw or filtered: the operation is linear) -> same window with the
+    electrode patch shifted by ``k`` rows, or reversed for k == "rev"."""
+    if k == 0:
+        return emg
+    if k == "rev":
+        return emg[:, ::-1].copy()
+    if abs(k) == 0.5:
+        return 0.5 * emg + 0.5 * patch_shift(emg, int(np.sign(k)), rng)
+    sd = emg.std() + 1e-12
+    out = rng.normal(0, 0.01 * sd, emg.shape)           # near-silent where nothing was recorded
+    if k == 1:
+        out[:, :6] = emg[:, 2:8] - emg[:, [1]]
+    elif k == 2:
+        out[:, :4] = emg[:, 4:8] - emg[:, [3]]
+    elif k == -1:
+        out[:, 2:8] = emg[:, 0:6]
+    elif k == -2:
+        out[:, 4:8] = emg[:, 0:4]
+    else:
+        raise ValueError(f"unsupported patch shift {k!r}")
+    return out.astype(emg.dtype, copy=False)
+
+
+def random_patch_shift(level: str, rng: np.random.Generator):
+    """One shift drawn uniformly from SHIFT_LEVELS[level] (None for level 'none')."""
+    options = SHIFT_LEVELS[level]
+    return options[rng.integers(len(options))] if options else None
