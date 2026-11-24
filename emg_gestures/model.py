@@ -176,3 +176,101 @@ class AuraTCN(nn.Module):
 
 def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+# ------------------------------------------------------------------ patch-video CNN
+# Aura electrode patch (PiEEG Aura VR specification, skin-facing view): 5 rows x 2
+# columns of contacts, REF at (0, 0), BIAS at (4, 1); channels CH1-CH8 below.
+GRID_SHAPE = (5, 2)
+GRID_POS = ((0, 1), (1, 0), (1, 1), (2, 0), (2, 1), (3, 0), (3, 1), (4, 0))   # CH1..CH8 -> (row, col)
+FRAME, HOP = 50, 12          # as emg_gestures.frames: 200 ms frames every 48 ms at 250 Hz
+
+GRID_CONFIG = dict(n_filters=8, temporal_kernel=25, n_spatial=16, emg_width=48, imu_width=16, k=3,
+                   emg_dilations=(1, 2, 4), imu_dilations=(1, 2), pool_rows=False)
+
+
+class GridCNNHybrid(nn.Module):
+    """CNN on the electrode patch as a video (time x 5 rows x 2 columns), plus the IMU.
+
+    EMG (B, T, 8), filtered and gain-normalised at 250 Hz, is placed on the patch
+    grid: each channel in its contact's pixel, the REF pixel 0 (every channel is
+    measured against it) and the BIAS pixel 0 with a mask channel marking it as
+    unmeasured. Then:
+      1. a learned filterbank in time (n_filters kernels of ``temporal_kernel``
+         samples), shared by all pixels
+      2. spatial convolution over the grid (3 rows x 2 columns, rows padded) at every
+         time step: learned combinations of neighbouring electrodes
+      3. power per 200 ms frame (hop 48 ms), log -> one feature per spatial filter
+         and row; rows keep their position unless ``pool_rows`` (then averaged,
+         which ignores where on the patch the activity is)
+    IMU (B, T, 6): per-frame mean and standard deviation of each axis (as
+    emg_gestures.frames.imu_frames). Both frame sequences go to AuraTCN's two
+    temporal branches, attention pooling and classifier; trained end to end."""
+
+    def __init__(self, n_classes: int = 6, n_filters: int = 8, temporal_kernel: int = 25,
+                 n_spatial: int = 16, emg_width: int = 48, imu_width: int = 16, k: int = 3,
+                 emg_dilations=(1, 2), imu_dilations=(1, 2), pool_rows: bool = False,
+                 dropout: float = 0.15, use_imu: bool = True, n_domains: int = 0,
+                 emg_in=None, imu_in=None):
+        super().__init__()
+        H, W = GRID_SHAPE
+        pix = torch.full((H * W,), -1, dtype=torch.long)
+        for c, (r, col) in enumerate(GRID_POS):
+            pix[r * W + col] = c
+        self.register_buffer("pix", pix)                                 # pixel -> channel (-1: none)
+        measured = torch.zeros(H * W)
+        measured[[r * W + col for r, col in GRID_POS]] = 1
+        measured[0] = 1                                                  # REF: known, 0 by definition
+        self.register_buffer("measured", measured.view(1, 1, H, W))
+        self.pool_rows = pool_rows
+        self.temporal = nn.Conv2d(1, n_filters, (temporal_kernel, 1), padding=(temporal_kernel // 2, 0),
+                                  bias=False)
+        self.spatial = nn.Sequential(
+            nn.Conv2d(n_filters + 1, n_spatial, (3, 2), padding=(1, 0)), nn.GELU(),
+            nn.Conv2d(n_spatial, n_spatial, (3, 1), padding=(1, 0)))
+        n_feat = n_spatial * (1 if pool_rows else H)
+        self.emg_norm = nn.LayerNorm(n_feat)
+        self.imu_norm = nn.LayerNorm(12)
+        self.tcn = AuraTCN(n_classes, emg_in=n_feat, imu_in=12, emg_width=emg_width, imu_width=imu_width,
+                           k=k, emg_dilations=emg_dilations, imu_dilations=imu_dilations,
+                           dropout=dropout, use_imu=use_imu, n_domains=n_domains)
+        self.domain_head = self.tcn.domain_head
+
+    def frames(self, emg, imu, mask):
+        """Samples -> per-frame EMG features (B, F, n_feat), IMU (B, F, 12), frame mask (B, F)."""
+        B, T, _ = emg.shape
+        H, W = GRID_SHAPE
+        x = emg * mask.unsqueeze(-1)
+        grid = torch.cat([torch.zeros_like(x[..., :1]), x], dim=-1)[..., self.pix + 1]   # (B, T, H*W)
+        z = self.temporal(grid.unsqueeze(1))                                           # (B, F1, T, H*W)
+        F1 = z.shape[1]
+        z = z.permute(0, 2, 1, 3).reshape(B * T, F1, H, W)
+        z = torch.cat([z, self.measured.expand(B * T, 1, H, W)], dim=1)
+        z = self.spatial(z).squeeze(-1)                                                # (B*T, F2, H)
+        if self.pool_rows:
+            z = z.mean(-1, keepdim=True)
+        z = z.reshape(B, T, -1).transpose(1, 2) ** 2                                   # (B, F2*H, T) power
+        p = F.avg_pool1d(z, FRAME, HOP)                                                # (B, n_feat, F)
+        e = self.emg_norm(torch.log(p + 1e-4).transpose(1, 2))
+        im = (imu * mask.unsqueeze(-1)).transpose(1, 2)
+        m1, m2 = F.avg_pool1d(im, FRAME, HOP), F.avg_pool1d(im ** 2, FRAME, HOP)
+        i = self.imu_norm(torch.cat([m1, (m2 - m1 ** 2).clamp(min=0).sqrt()], 1).transpose(1, 2))
+        fm = F.avg_pool1d(mask.float().unsqueeze(1), FRAME, HOP).squeeze(1) > 0.999   # whole frame valid
+        if not fm.any(1).all():
+            fm[:, 0] = True                                                            # very short window
+        return e, i, fm
+
+    def forward(self, emg, imu, mask):
+        return self.tcn(*self.frames(emg, imu, mask))
+
+    def forward_with_domain(self, emg, imu, mask, lam: float):
+        return self.tcn.forward_with_domain(*self.frames(emg, imu, mask), lam)
+
+    @property
+    def receptive_field(self) -> int:
+        return self.tcn.receptive_field
+
+
+def build_model(kind: str, config: dict, n_domains: int = 0) -> nn.Module:
+    """The network for an input kind: GridCNNHybrid for "grid", AuraTCN otherwise."""
+    return (GridCNNHybrid if kind == "grid" else AuraTCN)(**config, n_domains=n_domains)

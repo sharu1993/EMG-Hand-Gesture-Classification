@@ -13,6 +13,10 @@ Inputs (--input):
            cross-channel correlations, IMU stats (emg_gestures/frames.py). Default.
   riemann  per frame, 8x8 channel covariance in 3 bands mapped to the tangent
            space (emg_gestures/riemann.py), plus the same IMU stats
+  grid     the filtered EMG at 250 Hz placed on the electrode patch (5 rows x 2
+           columns, PiEEG's layout) as a video, through a CNN (learned time
+           filters, spatial convolutions over the patch, power per frame), plus
+           the IMU; emg_gestures.model.GridCNNHybrid
   riemann_corr
            riemann plus the same covariances scaled to correlation matrices
            (co-activation pattern without channel power): 192 values per frame
@@ -99,7 +103,8 @@ from emg_gestures.frames import (BAND_COLS_OF_CHANNEL, CORR_COLS_OF_CHANNEL,  # 
 from emg_gestures.riemann import riemann_frames  # noqa: E402
 from emg_gestures.metrics import confusion, f1_per_class, macro_f1, session_folds  # noqa: E402
 from emg_gestures.model import (FRAME_CONFIG, RAW_CONFIG, RIEMANN_CONFIG,  # noqa: E402
-                                RIEMANN_CORR_CONFIG, AuraTCN, count_parameters, preprocess)
+                                RIEMANN_CORR_CONFIG, GRID_CONFIG, AuraTCN, build_model,
+                                count_parameters, preprocess)
 from emg_gestures.segments import LABELS, load_segments  # noqa: E402
 from emg_gestures.windows import (ALIGNED, LABEL_TO_ID, NO_TRIM, STEADY_STATE,  # noqa: E402
                                   TRAIN_WINDOW_SETS, fixed_windows, testlike_val_windows,
@@ -108,9 +113,9 @@ from emg_gestures.windows import (ALIGNED, LABEL_TO_ID, NO_TRIM, STEADY_STATE,  
 SESSIONS_60HZ = {10, 11, 15, 16, 22, 23, 24}
 # Inputs computed from the signal (covariances are not linear in it), so their
 # augmentation runs in the signal domain when the training pool is built.
-SIGNAL_AUG_KINDS = ("riemann", "riemann_corr")
+SIGNAL_AUG_KINDS = ("riemann", "riemann_corr", "grid")
 CONFIGS = {"frames": FRAME_CONFIG, "riemann": RIEMANN_CONFIG,
-           "riemann_corr": RIEMANN_CORR_CONFIG, "raw": RAW_CONFIG}
+           "riemann_corr": RIEMANN_CORR_CONFIG, "raw": RAW_CONFIG, "grid": GRID_CONFIG}
 
 # --sweep: configurations run back to back on the same prepared data, a 2 x 2
 # design: covariance features with / without correlation features, person-
@@ -168,6 +173,8 @@ def _prep(job):
         e, i = augment_emg_signal(e, rng), augment_imu_signal(i, rng)
     if kind == "frames":
         e, i = window_frames(e, i)
+    elif kind == "grid":
+        pass                                     # the network takes the samples themselves
     elif kind in SIGNAL_AUG_KINDS:
         e, i = riemann_frames(e, corr=kind == "riemann_corr"), imu_frames(i)
     return e, i, LABEL_TO_ID[w.label], w.session, w.sample_id, w.offset_s
@@ -289,7 +296,7 @@ def augment(e, i, kind: str, std: Standardizer, gen: torch.Generator):
 
 def feature_noise(e, i, kind: str, gen: torch.Generator):
     """Noise in standardised units (frame and riemann inputs)."""
-    if kind == "frames" or kind in SIGNAL_AUG_KINDS:
+    if kind in ("frames", "riemann", "riemann_corr"):
         e = e + 0.1 * torch.randn(e.shape, generator=gen, device=e.device)
         i = i + 0.1 * torch.randn(i.shape, generator=gen, device=i.device)
     return e, i
@@ -306,7 +313,7 @@ def model_config(args) -> dict:
 def train_model(pool: Pool, idx: torch.Tensor, args, device, seed: int):
     torch.manual_seed(seed)
     gen = torch.Generator(device=device).manual_seed(seed)
-    std = Standardizer(pool, idx, enabled=args.input != "raw")
+    std = Standardizer(pool, idx, enabled=args.input not in ("raw", "grid"))
 
     # domain labels for adversarial training
     if args.adversarial == "session":
@@ -326,7 +333,7 @@ def train_model(pool: Pool, idx: torch.Tensor, args, device, seed: int):
         frac60 = pool.is60[idx].float().mean().clamp(1e-6, 1 - 1e-6)
         w_all = torch.where(pool.is60, 0.5 / frac60, 0.5 / (1 - frac60))
 
-    model = AuraTCN(**model_config(args), n_domains=n_domains).to(device)
+    model = build_model(args.input, model_config(args), n_domains=n_domains).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     n_batches = math.ceil(len(idx) / args.batch)
     total = args.epochs * n_batches
@@ -538,7 +545,7 @@ class DataCache:
                                     augment_seed=aug_seed, person_aug=person_aug,
                                     shift_level=shift_level)
             cfg_args = argparse.Namespace(**{**vars(a), "input": kind})
-            probe = AuraTCN(**model_config(cfg_args))
+            probe = build_model(kind, model_config(cfg_args))
             unit = "samples" if kind == "raw" else "frames"
             print(f"device {self.device}; input {kind}; align {align}; person aug {person_aug}; "
                   f"shift aug {shift_level}; "
@@ -556,7 +563,7 @@ def cross_validate(train: Pool, val: Pool, raw: Pool, args, device, t0: float,
                    show_details: bool = True, tl: Pool | None = None) -> dict:
     """Session-held-out CV for one configuration; writes the report and
     probabilities next to ``args.report`` and returns the report."""
-    probe = AuraTCN(**model_config(args))
+    probe = build_model(args.input, model_config(args))
     sessions = np.unique(train.session_np)
     folds = session_folds(sessions, args.folds)                # same folds as scripts/baseline.py
     prob_val = np.full((len(val), len(LABELS)), np.nan, np.float32)

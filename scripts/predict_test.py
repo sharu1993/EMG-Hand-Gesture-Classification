@@ -78,14 +78,14 @@ def predict_baseline(actions, args) -> np.ndarray:
 def predict_tcn(actions, args) -> np.ndarray:
     import torch
     from emg_gestures.frames import imu_frames, window_frames
-    from emg_gestures.model import AuraTCN, preprocess
+    from emg_gestures.model import build_model, preprocess
     from emg_gestures.riemann import riemann_frames
 
     ck = torch.load(args.checkpoint, map_location="cpu")
     kind = ck["input"]
     models = []
     for state in ck.get("state_dicts", [ck["state_dict"]]):   # several seeds: average them
-        m = AuraTCN(**ck["config"])
+        m = build_model(kind, ck["config"])
         m.load_state_dict(state)
         models.append(m.eval())
 
