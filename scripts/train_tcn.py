@@ -33,6 +33,11 @@ background noise mixed in (weaker gesture contrast) and a random spectral tilt
              patch shifted, as if the band were worn rotated (small: up to one row;
              wide: up to two rows or the band reversed; emg_gestures/augment.py)
 
+--train-windows steady|testlike|both|both_natural
+             training windows (see scripts/baseline.py): steady (default), test-like
+             windows with the end of the onset movement, or both. Every run also
+             scores test-like validation windows (1.4 s from 0.5 s after the cue).
+
 --seeds N    train N models per fold (and N for --final) with different seeds
              and average their probabilities. The --final checkpoint holds all N.
 
@@ -97,7 +102,8 @@ from emg_gestures.model import (FRAME_CONFIG, RAW_CONFIG, RIEMANN_CONFIG,  # noq
                                 RIEMANN_CORR_CONFIG, AuraTCN, count_parameters, preprocess)
 from emg_gestures.segments import LABELS, load_segments  # noqa: E402
 from emg_gestures.windows import (ALIGNED, LABEL_TO_ID, NO_TRIM, STEADY_STATE,  # noqa: E402
-                                  WindowSampler, fixed_windows)
+                                  TRAIN_WINDOW_SETS, fixed_windows, testlike_val_windows,
+                                  training_windows)
 
 SESSIONS_60HZ = {10, 11, 15, 16, 22, 23, 24}
 # Inputs computed from the signal (covariances are not linear in it), so their
@@ -408,6 +414,8 @@ def main() -> None:
                          "it per run")
     ap.add_argument("--shift-aug", choices=["none", "small", "wide"], default="none",
                     help="patch-shift augmentation for the riemann inputs (default none)")
+    ap.add_argument("--train-windows", choices=list(TRAIN_WINDOW_SETS), default="steady",
+                    help="training windows: steady (default), testlike, both, both_natural")
     ap.add_argument("--seeds", type=int, default=1,
                     help="models per fold (and for --final), averaged; each gets its own seed")
     ap.add_argument("--group-balance", action="store_true",
@@ -430,7 +438,8 @@ def main() -> None:
     data = DataCache(load_segments(args.segments), args, device)
 
     if args.final:
-        train, _, _ = data.pools(args.input, args.align, args.person_aug, args.shift_aug)
+        train, _, _ = data.pools(args.input, args.align, args.person_aug, args.shift_aug,
+                                 args.train_windows)
         states = []
         for j in range(args.seeds):
             model, std = train_model(train, torch.arange(len(train), device=device), args, device,
@@ -442,7 +451,7 @@ def main() -> None:
         # the standardizer depends only on the training pool, so it is the same for every seed
         torch.save({"state_dict": states[0], "state_dicts": states, "labels": LABELS,
                     "input": args.input, "align": args.align, "person_aug": args.person_aug,
-                    "shift_aug": args.shift_aug,
+                    "shift_aug": args.shift_aug, "train_windows": args.train_windows,
                     "config": model_config(args), "standardizer": std.state()}, args.out)
         print(f"saved {args.out} ({args.seeds} model(s), {time.time() - t0:.0f} s)")
         return
@@ -453,16 +462,19 @@ def main() -> None:
             run_args = argparse.Namespace(**{**vars(args), **overrides})
             run_args.report = args.report.parent / f"tcn_{name}.json"
             print(f"\n=== {name}: input {run_args.input}, align {run_args.align}, "
-                  f"person aug {run_args.person_aug}, shift aug {run_args.shift_aug}, seeds {run_args.seeds}, "
+                  f"person aug {run_args.person_aug}, shift aug {run_args.shift_aug}, "
+                  f"windows {run_args.train_windows}, seeds {run_args.seeds}, "
                   f"group balance {run_args.group_balance}, adversarial {run_args.adversarial}",
                   flush=True)
             t1 = time.time()
             train, val, raw = data.pools(run_args.input, run_args.align, run_args.person_aug,
-                                         run_args.shift_aug)
-            report = cross_validate(train, val, raw, run_args, device, t0, show_details=False)
+                                         run_args.shift_aug, run_args.train_windows)
+            report = cross_validate(train, val, raw, run_args, device, t0, show_details=False,
+                                    tl=data.tl_pool(run_args.input))
             rows.append({"run": name, "steady_F1": report["steady_macro_F1"],
                          "50Hz": report["50Hz_sessions"], "60Hz": report["60Hz_sessions"],
                          "untrimmed_1.4s": report["untrimmed_1.4s_macro_F1"],
+                         "testlike": report["testlike_macro_F1"],
                          "minutes": (time.time() - t1) / 60})
         table = pd.DataFrame(rows).set_index("run")
         print("\nSummary: macro F1, sessions held out (same folds as the baseline)")
@@ -473,8 +485,9 @@ def main() -> None:
               f"{(time.time() - t0) / 60:.1f} min")
         return
 
-    train, val, raw = data.pools(args.input, args.align, args.person_aug, args.shift_aug)
-    cross_validate(train, val, raw, args, device, t0, show_details=True)
+    train, val, raw = data.pools(args.input, args.align, args.person_aug, args.shift_aug,
+                                 args.train_windows)
+    cross_validate(train, val, raw, args, device, t0, show_details=True, tl=data.tl_pool(args.input))
 
 
 class DataCache:
@@ -491,32 +504,37 @@ class DataCache:
         for s, g in segs.groupby("session"):
             self.val_w += fixed_windows(g, length=1.2, stride=0.5)
             self.raw_w += fixed_windows(g, length=1.4, stride=0.5, trims=NO_TRIM)
+        self.tl_w = testlike_val_windows(segs)           # shaped like the test actions
 
-    def train_windows(self, align: bool):
-        if align not in self._train_w:
+    def train_windows(self, align: bool, train_set: str = "steady"):
+        if (align, train_set) not in self._train_w:
             segs = align_segments(self.segs) if align else self.segs
             if align:
                 print("alignment:", segs.align_method.value_counts().to_dict(), flush=True)
-            w = []
-            for s, g in segs.groupby("session"):
-                w += WindowSampler(g, trims=ALIGNED if align else STEADY_STATE,
-                                   seed=self.args.seed * 1000 + s).sample_many(self.args.per_session)
-            self._train_w[align] = w
-        return self._train_w[align]
+            self._train_w[(align, train_set)] = training_windows(
+                segs, train_set, self.args.per_session, self.args.seed, ALIGNED if align else STEADY_STATE)
+        return self._train_w[(align, train_set)]
 
-    def pools(self, kind: str, align: bool, person_aug: bool = False, shift_level: str = "none"):
+    def tl_pool(self, kind: str):
+        """Test-like validation windows (1.4 s from 0.5 s after the cue)."""
+        if ("tl", kind) not in self._pools:
+            self._pools[("tl", kind)] = Pool(self.tl_w, kind, self.device, self.args.workers)
+        return self._pools[("tl", kind)]
+
+    def pools(self, kind: str, align: bool, person_aug: bool = False, shift_level: str = "none",
+              train_set: str = "steady"):
         a, t0 = self.args, time.time()
         person_aug = person_aug and kind in SIGNAL_AUG_KINDS
         if shift_level != "none" and kind not in SIGNAL_AUG_KINDS:
             print(f"WARNING: --shift-aug applies to the riemann inputs only; ignored for {kind}", flush=True)
             shift_level = "none"
-        key = ("train", kind, align, person_aug, shift_level)
+        key = ("train", kind, align, person_aug, shift_level, train_set)
         if ("val", kind) not in self._pools:
             self._pools[("val", kind)] = Pool(self.val_w, kind, self.device, a.workers)
             self._pools[("raw", kind)] = Pool(self.raw_w, kind, self.device, a.workers)
         if key not in self._pools:
             aug_seed = a.seed + 1 if kind in SIGNAL_AUG_KINDS else None   # signal-domain augmentation
-            self._pools[key] = Pool(self.train_windows(align), kind, self.device, a.workers,
+            self._pools[key] = Pool(self.train_windows(align, train_set), kind, self.device, a.workers,
                                     augment_seed=aug_seed, person_aug=person_aug,
                                     shift_level=shift_level)
             cfg_args = argparse.Namespace(**{**vars(a), "input": kind})
@@ -535,7 +553,7 @@ class DataCache:
 
 
 def cross_validate(train: Pool, val: Pool, raw: Pool, args, device, t0: float,
-                   show_details: bool = True) -> dict:
+                   show_details: bool = True, tl: Pool | None = None) -> dict:
     """Session-held-out CV for one configuration; writes the report and
     probabilities next to ``args.report`` and returns the report."""
     probe = AuraTCN(**model_config(args))
@@ -543,6 +561,7 @@ def cross_validate(train: Pool, val: Pool, raw: Pool, args, device, t0: float,
     folds = session_folds(sessions, args.folds)                # same folds as scripts/baseline.py
     prob_val = np.full((len(val), len(LABELS)), np.nan, np.float32)
     prob_raw = np.full((len(raw), len(LABELS)), np.nan, np.float32)
+    prob_tl = np.full((len(tl), len(LABELS)), np.nan, np.float32) if tl is not None else None
     run = args.fold_ids if args.fold_ids is not None else range(len(folds))[:args.max_folds]
     for k in run:
         held = folds[k].tolist()
@@ -550,7 +569,7 @@ def cross_validate(train: Pool, val: Pool, raw: Pool, args, device, t0: float,
         tr_idx = torch.from_numpy(np.flatnonzero(~np.isin(train.session_np, held))).to(device)
         for j in range(args.seeds):                       # seed averaging: mean of the models' probabilities
             model, std = train_model(train, tr_idx, args, device, args.seed + k + SEED_STEP * j)
-            for pool, prob in ((val, prob_val), (raw, prob_raw)):
+            for pool, prob in ((val, prob_val), (raw, prob_raw)) + (((tl, prob_tl),) if tl is not None else ()):
                 idx_np = np.flatnonzero(np.isin(pool.session_np, held))
                 p = predict(model, std, pool, torch.from_numpy(idx_np).to(device)) / args.seeds
                 prob[idx_np] = p if j == 0 else prob[idx_np] + p
@@ -568,6 +587,9 @@ def cross_validate(train: Pool, val: Pool, raw: Pool, args, device, t0: float,
         "50Hz_sessions": macro_f1(y[~g60], p[~g60]) if (~g60).any() else None,
         "60Hz_sessions": macro_f1(y[g60], p[g60]) if g60.any() else None,
         "untrimmed_1.4s_macro_F1": macro_f1(raw.y_np[rdone], prob_raw[rdone].argmax(1)),
+        "testlike_macro_F1": (macro_f1(tl.y_np[~np.isnan(prob_tl[:, 0])],
+                                       prob_tl[~np.isnan(prob_tl[:, 0])].argmax(1))
+                              if tl is not None else None),
         "per_class_F1": dict(zip(LABELS, f1_per_class(y, p, range(6)).round(3).tolist())),
         "per_session_F1": {int(s): round(macro_f1(y[sess == s], p[sess == s]), 3)
                            for s in np.unique(sess)},
@@ -587,7 +609,9 @@ def cross_validate(train: Pool, val: Pool, raw: Pool, args, device, t0: float,
     np.savez_compressed(probs_path, prob_val=prob_val, y_val=val.y_np, session_val=val.session_np,
                         sample_id_val=val.sample_id, offset_val=val.offset,
                         prob_raw=prob_raw, y_raw=raw.y_np, session_raw=raw.session_np,
-                        sample_id_raw=raw.sample_id, offset_raw=raw.offset, labels=LABELS)
+                        sample_id_raw=raw.sample_id, offset_raw=raw.offset, labels=LABELS,
+                        **({} if tl is None else dict(prob_tl=prob_tl, y_tl=tl.y_np, session_tl=tl.session_np,
+                                                      sample_id_tl=tl.sample_id, offset_tl=tl.offset)))
     print(f"saved {args.report} and {probs_path}", flush=True)
     return report
 

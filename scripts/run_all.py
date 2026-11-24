@@ -9,6 +9,8 @@
     python scripts/run_all.py --seeds 3    # average 3 TCN seeds per fold (~3x the TCN time)
     python scripts/run_all.py --shift-aug wide   # train every model with patch-shift augmentation;
                                                  # results go to outputs_shiftwide/ by default
+    python scripts/run_all.py --train-windows both   # train on steady + test-like windows;
+                                                     # results go to outputs_winboth/ by default
     python scripts/run_all.py --skip-tcn   # baseline + ensemble only, reusing the TCN results
                                            # already in outputs/ (same windows required)
     python scripts/run_all.py --quick      # tiny settings, ~3 min: checks that everything runs
@@ -64,23 +66,27 @@ def main() -> None:
                     help="TCN models per fold, averaged (the submission uses 3 regardless)")
     ap.add_argument("--shift-aug", choices=["none", "small", "wide"], default="none",
                     help="patch-shift augmentation for all models (default none)")
+    ap.add_argument("--train-windows", choices=["steady", "testlike", "both", "both_natural"],
+                    default="steady", help="training window set for all models (default steady)")
     ap.add_argument("--outdir", type=Path, default=None,
-                    help="default outputs/, or outputs_shift<level>/ with --shift-aug")
+                    help="default outputs[_win<set>][_shift<level>]/")
     args = ap.parse_args()
 
     py = sys.executable
     if args.outdir is None:
-        args.outdir = Path("outputs" if args.shift_aug == "none" else f"outputs_shift{args.shift_aug}")
+        args.outdir = Path("outputs" + ("" if args.train_windows == "steady" else f"_win{args.train_windows}")
+                           + ("" if args.shift_aug == "none" else f"_shift{args.shift_aug}"))
     outdir = args.outdir if args.outdir.is_absolute() else ROOT / args.outdir
     shift = ["--shift-aug", args.shift_aug]
+    wins = ["--train-windows", args.train_windows]
     outdir.mkdir(parents=True, exist_ok=True)
     workers = ["--workers", str(args.workers)]
     steps = [
         ("1/3 feature baseline", [py, "scripts/baseline.py", "--align", "--outdir", str(outdir),
-                                   *shift, *workers, *(QUICK["baseline"] if args.quick else [])]),
+                                   *shift, *wins, *workers, *(QUICK["baseline"] if args.quick else [])]),
         ("2/3 TCN sweep", [py, "scripts/train_tcn.py", "--sweep", "--device", args.device,
                            "--report", str(outdir / "tcn_cv.json"), "--seeds", str(args.seeds),
-                           *shift, *workers,
+                           *shift, *wins, *workers,
                            *(QUICK["tcn"] if args.quick else [])]),
         ("3/3 ensemble", [py, "scripts/ensemble.py", "--auto", "--outdir", str(outdir), *shift]),
     ]

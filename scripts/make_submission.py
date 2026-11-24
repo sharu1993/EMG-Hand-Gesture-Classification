@@ -28,6 +28,10 @@ outputs_shift<level>/ensemble_choice.json (written by `run_all.py --shift-aug
 <level>`), trains every model with that level, uses checkpoint names ending in
 _shift<level>, and writes outputs_shift<level>/submission.csv.
 
+--train-windows testlike|both|both_natural does the same for models trained on
+test-like windows (`run_all.py --train-windows <set>`): folder
+outputs[_win<set>][_shift<level>]/, checkpoint names with _win<set>.
+
 The submission is checked before it is written: every test action exactly
 once, no extra ids, labels from the training set only.
 """
@@ -82,6 +86,8 @@ def main() -> None:
                     help="TCN checkpoint (default models/aura_tcn_<input>[_align][_pa].pt)")
     ap.add_argument("--shift-aug", choices=["none", "small", "wide"], default="none",
                     help="patch-shift augmentation level of all models (default none)")
+    ap.add_argument("--train-windows", choices=["steady", "testlike", "both", "both_natural"],
+                    default="steady", help="training window set of all models (default steady)")
     ap.add_argument("--choice", type=Path, default=None,
                     help="default outputs[_shift<level>]/ensemble_choice.json")
     ap.add_argument("--default-pair", action="store_true",
@@ -93,10 +99,11 @@ def main() -> None:
     ap.add_argument("--quick", action="store_true",
                     help="tiny training settings to check the pipeline runs (not a real submission)")
     args = ap.parse_args()
-    outdir = ROOT / ("outputs" if args.shift_aug == "none" else f"outputs_shift{args.shift_aug}")
+    outdir = ROOT / ("outputs" + ("" if args.train_windows == "steady" else f"_win{args.train_windows}")
+                     + ("" if args.shift_aug == "none" else f"_shift{args.shift_aug}"))
     args.choice = args.choice or outdir / "ensemble_choice.json"
     args.out = args.out or outdir / "submission.csv"
-    shift = ["--shift-aug", args.shift_aug]
+    shift = ["--shift-aug", args.shift_aug, "--train-windows", args.train_windows]
 
     py, t0 = sys.executable, time.time()
     tcn_input, tcn_align, base_config, base_align = DEFAULT_PAIR
@@ -111,6 +118,11 @@ def main() -> None:
             if levels != {args.shift_aug}:
                 raise SystemExit(f"{args.choice} holds models with shift augmentation {sorted(levels)}, "
                                  f"but --shift-aug is {args.shift_aug}")
+            wsets = {m.get("train_windows", "steady") for m in (choice["tcn"], choice["baseline"],
+                                                                choice.get("mlp")) if m}
+            if wsets != {args.train_windows}:
+                raise SystemExit(f"{args.choice} holds models trained on {sorted(wsets)} windows, "
+                                 f"but --train-windows is {args.train_windows}")
             person_aug = bool(choice["tcn"].get("person_aug", False))
             base_config, base_align = choice["baseline"]["config"], bool(choice["baseline"]["align"])
             if choice.get("mlp"):
@@ -131,6 +143,7 @@ def main() -> None:
     if args.checkpoint is None:
         args.checkpoint = ROOT / (f"models/aura_tcn_{tcn_input}{'_align' if tcn_align else ''}"
                                   f"{'_pa' if person_aug else ''}"
+                                  f"{'' if args.train_windows == 'steady' else '_win' + args.train_windows}"
                                   f"{'' if args.shift_aug == 'none' else '_shift' + args.shift_aug}.pt")
     quick_tcn = ["--per-session", "20", "--epochs", "1"] if args.quick else []
     seeds = ["--seeds", "1" if args.quick else str(args.tcn_seeds)]

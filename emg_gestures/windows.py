@@ -233,6 +233,97 @@ def fixed_windows(segments: pd.DataFrame, length: float = 1.2, stride: float = 0
     return out
 
 
+# Test-like windows. The test actions (v2) are 1.4 s windows that start about
+# 0.5 s after the cue: matching the time profile of movement (gyro) and muscle
+# activity inside the test windows to training windows cut at known offsets gives
+# the best match at 0.5 s (scripts/analysis notes). So a test window holds the end
+# of the movement into the gesture, then the hold, unlike the steady windows,
+# which skip the first 1.2 s of each gesture.
+TESTLIKE_START = (0.3, 0.7)      # training windows start this long after the cue
+TESTLIKE_VAL_START = 0.5         # validation windows, as the test actions
+TEST_LENGTH = 1.4
+TRAIN_WINDOW_SETS = ("steady", "testlike", "both", "both_natural")
+
+
+def testlike_windows(segments: pd.DataFrame, per_segment: int = 3, min_len: float = 0.75,
+                     max_len: float = 1.2, fs: float = 250.0, seed: int = 0,
+                     balance: str = "balanced") -> list[Window]:
+    """Training windows that include the end of the onset movement.
+
+    Each window's length is drawn first (min_len-max_len), independent of the
+    class, as in WindowSampler, so length carries no label information. The
+    start is drawn 0.3-0.7 s after the cue such that the window ends inside the
+    segment (never crossing into the next one); segments too short for the drawn
+    length are skipped. ``balance="balanced"`` keeps, per session, as many rest
+    windows as the average gesture class has; ``"natural"`` keeps all of them
+    (rest is then about half of the windows, so models lean towards rest)."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for r in segments.itertuples(index=False):
+        for _ in range(per_segment):
+            length = rng.uniform(min_len, max_len)
+            hi = min(TESTLIKE_START[1], r.t_end - r.t_start - length)
+            if hi < TESTLIKE_START[0]:
+                continue
+            t0 = r.t_start + rng.uniform(TESTLIKE_START[0], hi)
+            try:
+                emg, imu, n_raw = make_window(r.t, r.emg, r.imu, r.imu_new, t0, length, fs)
+            except TooFewRows:
+                continue
+            out.append(Window(emg, imu, r.label, r.sample_id, r.session, length, t0 - r.t_start, n_raw))
+    if balance == "natural":
+        return out
+    kept = []
+    for s in sorted({w.session for w in out}):
+        ws = [w for w in out if w.session == s]
+        gest = [w for w in ws if w.label != "rest"]
+        rest = [w for w in ws if w.label == "rest"]
+        n_cls = len({w.label for w in gest})
+        n = int(round(len(gest) / n_cls)) if n_cls else len(rest)
+        pick = rng.choice(len(rest), size=min(n, len(rest)), replace=False) if rest else []
+        kept += gest + [rest[i] for i in sorted(pick)]
+    return kept
+
+
+def testlike_val_windows(segments: pd.DataFrame, length: float = TEST_LENGTH,
+                         start: float = TESTLIKE_VAL_START, min_len: float = 1.24,
+                         fs: float = 250.0) -> list[Window]:
+    """One validation window per segment, shaped like a test action: 1.4 s from
+    0.5 s after the cue. Rest segments are often shorter than 1.9 s and the
+    segment files hold no rows beyond a segment's end, so the window is moved
+    earlier to fit (it then starts with the release of the previous gesture);
+    segments shorter than ``min_len`` (the shortest test action) are skipped."""
+    out = []
+    for r in segments.itertuples(index=False):
+        dur = r.t_end - r.t_start
+        s0 = max(0.0, min(start, dur - length))
+        L = min(length, dur - s0)
+        if L < min_len:
+            continue
+        try:
+            emg, imu, n_raw = make_window(r.t, r.emg, r.imu, r.imu_new, r.t_start + s0, L, fs)
+        except TooFewRows:
+            continue
+        out.append(Window(emg, imu, r.label, r.sample_id, r.session, L, s0, n_raw))
+    return out
+
+
+def training_windows(segments: pd.DataFrame, kind: str, per_session: int, seed: int,
+                     steady_trims: dict, fs: float = 250.0) -> list[Window]:
+    """Training windows of one of TRAIN_WINDOW_SETS: steady (WindowSampler on the
+    steady span, per_session per session, class-balanced), testlike, or both."""
+    if kind not in TRAIN_WINDOW_SETS:
+        raise ValueError(f"unknown training window set {kind!r}")
+    out = []
+    if kind != "testlike":
+        for s, g in segments.groupby("session"):
+            out += WindowSampler(g, trims=steady_trims, seed=seed * 1000 + s).sample_many(per_session)
+    if kind != "steady":
+        out += testlike_windows(segments, fs=fs, seed=seed + 4241,
+                                balance="natural" if kind == "both_natural" else "balanced")
+    return out
+
+
 def test_windows(test_df: pd.DataFrame, fs: float = 250.0) -> list[tuple[str, np.ndarray, np.ndarray]]:
     """Apply the same resampling and centring to the test actions.
 

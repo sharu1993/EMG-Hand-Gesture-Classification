@@ -56,17 +56,13 @@ def predict_baseline(actions, args) -> np.ndarray:
     from emg_gestures.align import align_segments
     from emg_gestures.features import window_features
     from emg_gestures.segments import load_segments
-    from emg_gestures.windows import ALIGNED, WindowSampler
-
-    from emg_gestures.windows import STEADY_STATE
+    from emg_gestures.windows import ALIGNED, STEADY_STATE, training_windows
 
     segs = load_segments(args.segments)
     if args.baseline_align:
         segs = align_segments(segs)
-    train_w = []
-    for s, g in segs.groupby("session"):
-        train_w += WindowSampler(g, trims=ALIGNED if args.baseline_align else STEADY_STATE,
-                                 seed=args.seed * 1000 + s).sample_many(args.per_session)
+    train_w = training_windows(segs, args.train_windows, args.per_session, args.seed,
+                               ALIGNED if args.baseline_align else STEADY_STATE)
     train = feature_table(train_w, args.workers, args.shift_aug, args.seed)
     keep = CONFIGS[args.baseline_config]
     cols = [c for c in train.columns if c not in META and keep(c)]
@@ -74,7 +70,7 @@ def predict_baseline(actions, args) -> np.ndarray:
     test = pd.DataFrame([window_features(e, i, riemann=True, corr=True) for _, e, i in actions])
     order = [list(clf.classes_).index(lab) for lab in LABELS]
     print(f"baseline '{args.baseline_config}' ({args.learner}, align {args.baseline_align}, "
-          f"shift aug {args.shift_aug}): {len(cols)} features, "
+          f"windows {args.train_windows}, shift aug {args.shift_aug}): {len(cols)} features, "
           f"{len(train)} training windows")
     return clf.predict_proba(test[cols])[:, order]
 
@@ -136,6 +132,8 @@ def main() -> None:
     ap.add_argument("--per-session", type=int, default=300)
     ap.add_argument("--shift-aug", choices=["none", "small", "wide"], default="none",
                     help="--model baseline: patch-shift augmentation level of the training windows")
+    ap.add_argument("--train-windows", choices=["steady", "testlike", "both", "both_natural"],
+                    default="steady", help="--model baseline: training window set")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=Path, default=None)

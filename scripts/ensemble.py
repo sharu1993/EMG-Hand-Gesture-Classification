@@ -24,7 +24,10 @@ session, in the same window order; this script checks that the windows match
         augmentation level (default none), so augmented and plain models are
         never mixed in one ensemble. "any" disables the filter.
 
---rank-by  balanced (default): mean of the 50 Hz and 60 Hz session scores;
+--rank-by  testlike (default): macro F1 on test-like validation windows (1.4 s
+           from 0.5 s after the cue, as the test actions); files without them
+           (older runs) are skipped by --auto.
+           balanced: mean of the 50 Hz and 60 Hz session scores;
            the test set is about half 50 Hz (test_1, 2, 4) and half 60 Hz
            (test_3, 5), so this matches it better than the overall score,
            which is dominated by the 21 training sessions at 50 Hz.
@@ -56,7 +59,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from emg_gestures.metrics import macro_f1  # noqa: E402
 
 SESSIONS_60HZ = {10, 11, 15, 16, 22, 23, 24}
-RANK_KEYS = {"balanced": "balanced", "steady": "steady_F1", "untrimmed": "untrimmed_1.4s"}
+RANK_KEYS = {"testlike": "testlike", "balanced": "balanced", "steady": "steady_F1",
+             "untrimmed": "untrimmed_1.4s"}
 # baseline.py file slugs -> its feature-set names (CONFIGS / ABLATIONS)
 BASELINE_CONFIGS = {"emg_imu": "EMG + IMU", "riemann_imu": "Riemann + IMU",
                     "riemann_corr_imu": "Riemann + Corr + IMU",
@@ -75,8 +79,9 @@ def load(path: Path) -> dict:
 def window_signature(d: dict) -> str:
     """Identifies the validation windows a file was scored on."""
     h = hashlib.sha1()
-    for k in ("y_val", "session_val", "y_raw", "session_raw"):
-        h.update(np.ascontiguousarray(d[k]).tobytes())
+    for k in ("y_val", "session_val", "y_raw", "session_raw", "y_tl", "session_tl"):
+        if k in d:                                     # test-like windows: newer runs only
+            h.update(np.ascontiguousarray(d[k]).tobytes())
     return h.hexdigest()
 
 
@@ -96,14 +101,23 @@ def check_same_windows(runs: dict[str, dict]) -> None:
                 raise SystemExit(f"{n} and {names[0]} were scored on different {part} windows")
 
 
-def score(p_val, p_raw, ref) -> dict:
+def score(p_val, p_raw, ref, p_tl=None) -> dict:
     y, s = ref["y_val"], ref["session_val"]
     pred = p_val.argmax(1)
     g60 = np.isin(s, list(SESSIONS_60HZ))
     f50, f60 = macro_f1(y[~g60], pred[~g60]), macro_f1(y[g60], pred[g60])
     return {"steady_F1": macro_f1(y, pred), "50Hz": f50, "60Hz": f60,
             "balanced": (f50 + f60) / 2,
-            "untrimmed_1.4s": macro_f1(ref["y_raw"], p_raw.argmax(1))}
+            "untrimmed_1.4s": macro_f1(ref["y_raw"], p_raw.argmax(1)),
+            "testlike": (macro_f1(ref["y_tl"], p_tl.argmax(1)) if p_tl is not None and "y_tl" in ref
+                         else np.nan)}
+
+
+def combine_tl(ds: list[dict], weights, geometric: bool):
+    """Combined test-like probabilities, or None if any model lacks them."""
+    if not all("prob_tl" in d for d in ds):
+        return None
+    return combine([d["prob_tl"] for d in ds], weights, geometric)
 
 
 def combine(probs: list[np.ndarray], weights, geometric: bool) -> np.ndarray:
@@ -127,18 +141,24 @@ def model_info(path: Path) -> dict:
         return {"kind": "tcn", "name": name, "input": args.get("input"),
                 "align": args.get("align") == "True",
                 "shift_aug": args.get("shift_aug", "none"),         # absent in older reports: none
+                "train_windows": args.get("train_windows", "steady"),
                 "person_aug": args.get("person_aug") == "True",   # absent in older reports: off
                 "extras_default": extras in ({}, {"group_balance": "False", "adversarial": "none"}),
                 "report": report.name if report.exists() else None}
-    kind, slug = name.split("_", 1)                     # baseline_<slug>[_align][_shift<level>]
+    kind, slug = name.split("_", 1)            # baseline_<slug>[_align][_win<set>][_shift<level>]
     shift = "none"
     for level in ("small", "wide"):
         if slug.endswith(f"_shift{level}"):
             shift, slug = level, slug[: -len(f"_shift{level}")]
+    windows = "steady"
+    for wset in ("both_natural", "testlike", "both"):
+        if slug.endswith(f"_win{wset}"):
+            windows, slug = wset, slug[: -len(f"_win{wset}")]
+            break
     align = slug.endswith("_align")
     slug = slug[: -len("_align")] if align else slug
     return {"kind": kind, "name": name, "config": BASELINE_CONFIGS.get(slug), "align": align,
-            "shift_aug": shift}
+            "shift_aug": shift, "train_windows": windows}
 
 
 def auto_candidates(outdir: Path, shift_aug: str = "none"):
@@ -177,7 +197,8 @@ def rank_combinations(tcn: dict, base: dict, mlp: dict, rank_key: str) -> pd.Dat
                                                [(None, None)] + list(mlp.items())):
         ds = [dt, db] + ([dm] if dm is not None else [])
         s = score(combine([d["prob_val"] for d in ds], [1] * len(ds), False),
-                  combine([d["prob_raw"] for d in ds], [1] * len(ds), False), dt)
+                  combine([d["prob_raw"] for d in ds], [1] * len(ds), False), dt,
+                  combine_tl(ds, [1] * len(ds), False))
         rows.append({"tcn": pt.name.replace(".probs.npz", ""),
                      "baseline": pb.name.replace(".probs.npz", ""),
                      "mlp": pm.name.replace(".probs.npz", "") if pm else "-", **s,
@@ -191,7 +212,7 @@ def main() -> None:
     ap.add_argument("probs", type=Path, nargs="*", help="*.probs.npz files to combine")
     ap.add_argument("--auto", action="store_true",
                     help="try every tcn_* x baseline_* pair in --outdir and pick the best")
-    ap.add_argument("--rank-by", choices=list(RANK_KEYS), default="balanced")
+    ap.add_argument("--rank-by", choices=list(RANK_KEYS), default="testlike")
     ap.add_argument("--weights", type=float, nargs="+", default=None,
                     help="one weight per file (default: equal)")
     ap.add_argument("--geometric", action="store_true",
@@ -230,11 +251,13 @@ def main() -> None:
     if len(weights) != len(runs):
         ap.error("--weights needs one value per file")
 
-    rows = [{"model": n, **score(d["prob_val"], d["prob_raw"], ref)} for n, d in runs.items()]
+    rows = [{"model": n, **score(d["prob_val"], d["prob_raw"], ref, d.get("prob_tl"))}
+            for n, d in runs.items()]
     kind = "geometric" if args.geometric else "arithmetic"
     combo = {"model": f"combined ({kind} mean, weights {weights})",
              **score(combine([d["prob_val"] for d in runs.values()], weights, args.geometric),
-                     combine([d["prob_raw"] for d in runs.values()], weights, args.geometric), ref)}
+                     combine([d["prob_raw"] for d in runs.values()], weights, args.geometric), ref,
+                     combine_tl(list(runs.values()), weights, args.geometric))}
     table = pd.DataFrame(rows + [combo]).set_index("model")
     print(f"\n{'Chosen pair' if args.auto else 'Models'}: macro F1, sessions held out "
           f"(same windows for every model)")
@@ -246,7 +269,8 @@ def main() -> None:
         for w in np.linspace(0, 1, 11):
             pv = combine([runs[n]["prob_val"] for n in names], [w, 1 - w], args.geometric)
             pr = combine([runs[n]["prob_raw"] for n in names], [w, 1 - w], args.geometric)
-            sweep.append({f"weight on {names[0]}": round(w, 1), **score(pv, pr, ref)})
+            pt = combine_tl([runs[n] for n in names], [w, 1 - w], args.geometric)
+            sweep.append({f"weight on {names[0]}": round(w, 1), **score(pv, pr, ref, pt)})
         print("\nWeight sweep (chosen on the same CV data: optimistic, for orientation only)")
         print(pd.DataFrame(sweep).round(3).to_string(index=False))
 

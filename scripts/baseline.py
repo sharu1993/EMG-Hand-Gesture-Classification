@@ -21,6 +21,14 @@ patch shifted, as if the band were worn rotated (small: up to one row; wide: up 
 two rows or the band reversed; emg_gestures/augment.py). Validation windows are
 never shifted. Output files then end in _shift<level>.
 
+--train-windows steady|testlike|both|both_natural picks the training windows:
+steady (default, above), test-like windows that include the end of the onset
+movement as the test actions do (emg_gestures/windows.py, testlike_windows), or
+both. Window lengths are drawn independently of the class. both_natural keeps
+every rest window instead of balancing classes. Output files then carry
+_win<set>. Every run also scores test-like validation windows (1.4 s from 0.5 s
+after the cue, one per segment), the closest match to the test actions.
+
 Every configuration saves its cross-validated class probabilities to
 outputs/baseline_<name>.probs.npz (trees) and outputs/mlp_<name>.probs.npz
 (MLP), in the same format and window order as scripts/train_tcn.py, for
@@ -53,8 +61,8 @@ from emg_gestures.align import align_segments  # noqa: E402
 from emg_gestures.augment import SHIFT_LEVELS, patch_shift, random_patch_shift  # noqa: E402
 from emg_gestures.features import window_features  # noqa: E402
 from emg_gestures.segments import LABELS, load_segments  # noqa: E402
-from emg_gestures.windows import (ALIGNED, NO_TRIM, STEADY_STATE, WindowSampler,  # noqa: E402
-                                  fixed_windows)
+from emg_gestures.windows import (ALIGNED, NO_TRIM, STEADY_STATE, TRAIN_WINDOW_SETS,  # noqa: E402
+                                  fixed_windows, testlike_val_windows, training_windows)
 
 # Sessions recorded with 60 Hz mains and (mostly) a ~45 Hz IMU: a second setup.
 SESSIONS_60HZ = {10, 11, 15, 16, 22, 23, 24}
@@ -160,11 +168,16 @@ def run_cv(train: pd.DataFrame, tables: dict, cols, folds: int, seed: int, learn
     return probs, np.array(fold_f1)
 
 
-def save_probs(path: Path, val: pd.DataFrame, raw: pd.DataFrame, p_val, p_raw):
+def save_probs(path: Path, val: pd.DataFrame, raw: pd.DataFrame, p_val, p_raw,
+               tl: pd.DataFrame | None = None, p_tl=None):
     lab_id = {lab: i for i, lab in enumerate(LABELS)}
     path.parent.mkdir(parents=True, exist_ok=True)
+    extra = {} if tl is None else dict(
+        prob_tl=p_tl.astype(np.float32), y_tl=tl.label.map(lab_id).to_numpy(),
+        session_tl=tl.session.to_numpy(np.int64), sample_id_tl=tl.sample_id.to_numpy(str),
+        offset_tl=tl.offset_s.to_numpy(np.float32))
     np.savez_compressed(
-        path, prob_val=p_val.astype(np.float32), y_val=val.label.map(lab_id).to_numpy(),
+        path, **extra, prob_val=p_val.astype(np.float32), y_val=val.label.map(lab_id).to_numpy(),
         session_val=val.session.to_numpy(np.int64), sample_id_val=val.sample_id.to_numpy(str),
         offset_val=val.offset_s.to_numpy(np.float32),
         prob_raw=p_raw.astype(np.float32), y_raw=raw.label.map(lab_id).to_numpy(),
@@ -185,6 +198,8 @@ def main() -> None:
     ap.add_argument("--ablations", action="store_true", help="also run single-group feature sets")
     ap.add_argument("--mlp", action=argparse.BooleanOptionalAction, default=True,
                     help="also cross-validate the MLP on each main feature set (default on)")
+    ap.add_argument("--train-windows", choices=list(TRAIN_WINDOW_SETS), default="steady",
+                    help="training windows: steady (default), testlike, both, both_natural")
     ap.add_argument("--shift-aug", choices=list(SHIFT_LEVELS), default="none",
                     help="add patch-shifted copies of the training windows (default none)")
     ap.add_argument("--outdir", type=Path, default=Path("outputs"))
@@ -194,15 +209,16 @@ def main() -> None:
     t0 = time.time()
     segs = load_segments(args.segments)
     train_segs = align_segments(segs) if args.align else segs
-    train_w, val_w, raw_w = [], [], []
-    for s, g in train_segs.groupby("session"):
-        train_w += WindowSampler(g, trims=ALIGNED if args.align else STEADY_STATE,
-                                 seed=args.seed * 1000 + s).sample_many(args.per_session)
+    train_w = training_windows(train_segs, args.train_windows, args.per_session, args.seed,
+                               ALIGNED if args.align else STEADY_STATE)
+    val_w, raw_w = [], []
+    tl_w = testlike_val_windows(segs)
     for s, g in segs.groupby("session"):
         val_w += fixed_windows(g, length=1.2, stride=0.5)
         raw_w += fixed_windows(g, length=1.4, stride=0.5, trims=NO_TRIM)
-    print(f"{len(train_w)} training windows (align {args.align}), {len(val_w)} steady validation "
-          f"windows, {len(raw_w)} untrimmed 1.4 s windows, {segs.session.nunique()} sessions")
+    print(f"{len(train_w)} training windows ({args.train_windows}, align {args.align}), {len(val_w)} "
+          f"steady validation windows, {len(raw_w)} untrimmed 1.4 s windows, {len(tl_w)} test-like "
+          f"windows, {segs.session.nunique()} sessions")
 
     train = feature_table(train_w, args.workers, args.shift_aug, args.seed)
     if args.shift_aug != "none":
@@ -210,6 +226,7 @@ def main() -> None:
               f"({len(train_w)} as worn + {len(train) - len(train_w)} shifted)")
     val = feature_table(val_w, args.workers)
     raw = feature_table(raw_w, args.workers)
+    tl = feature_table(tl_w, args.workers)
     print(f"features: {time.time() - t0:.0f} s")
 
     def group_f1(df, pred, sixty: bool):
@@ -222,18 +239,23 @@ def main() -> None:
         jobs += [(name, keep, "mlp") for name, keep in CONFIGS.items()]
     for name, keep, learner in jobs:
         cols = [c for c in train.columns if c not in META and keep(c)]
-        probs, fold_f1 = run_cv(train, {"val": val, "raw": raw}, cols, args.folds, args.seed, learner)
+        probs, fold_f1 = run_cv(train, {"val": val, "raw": raw, "tl": tl}, cols, args.folds, args.seed,
+                                learner)
         pred = np.array(LABELS)[probs["val"].argmax(1)]
         pred_raw = np.array(LABELS)[probs["raw"].argmax(1)]
+        pred_tl = np.array(LABELS)[probs["tl"].argmax(1)]
         f1 = f1_score(val.label, pred, average="macro")
         results.append((name, learner, len(cols), round(f1, 3), round(fold_f1.std(), 3),
                         group_f1(val, pred, False), group_f1(val, pred, True),
-                        round(f1_score(raw.label, pred_raw, average="macro"), 3)))
+                        round(f1_score(raw.label, pred_raw, average="macro"), 3),
+                        round(f1_score(tl.label, pred_tl, average="macro"), 3)))
         slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
         prefix = "baseline" if learner == "hgb" else "mlp"
-        suffix = ("_align" if args.align else "") + ("" if args.shift_aug == "none" else f"_shift{args.shift_aug}")
+        suffix = (("_align" if args.align else "")
+                  + ("" if args.train_windows == "steady" else f"_win{args.train_windows}")
+                  + ("" if args.shift_aug == "none" else f"_shift{args.shift_aug}"))
         save_probs(args.outdir / f"{prefix}_{slug}{suffix}.probs.npz",
-                   val, raw, probs["val"], probs["raw"])
+                   val, raw, probs["val"], probs["raw"], tl, probs["tl"])
         if best is None or f1 > best[1]:
             best = (f"{name} ({learner})", f1, pred, cols)
 
@@ -241,7 +263,7 @@ def main() -> None:
     print(f"\nMacro F1, sessions held out ({args.folds} folds). Chance ~{chance:.2f}")
     print(pd.DataFrame(results, columns=["features", "learner", "n_feat", "steady_F1", "fold_std",
                                          "50Hz_sessions", "60Hz_sessions",
-                                         "untrimmed_1.4s_F1"]).to_string(index=False))
+                                         "untrimmed_1.4s_F1", "testlike_F1"]).to_string(index=False))
     print(f"probabilities saved to {args.outdir}/baseline_*.probs.npz (trees) and mlp_*.probs.npz (MLP)")
 
     name, f1, pred, cols = best
