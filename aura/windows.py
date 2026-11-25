@@ -1,7 +1,10 @@
 """Training and validation windows that copy the test actions.
 
-A test action is a 1.4 s window by timestamp, starting about 0.5-0.6 s after a
-guided segment's cue, mean-centred per channel. So a window here is:
+A test action is a 1.4 s window by timestamp, mean-centred per channel. Fitting
+the test's IMU distribution as a mix of rest windows and gesture windows puts
+the gesture windows at about 0.7 s after the cue in the 50 Hz files and 0.9 s
+in the 60 Hz files (25 Nov 2026; an earlier estimate from the average gyro
+profile's shape alone said 0.5-0.6 s). So a window here is:
   * cut by timestamp: rows with t0 + offset <= t < t0 + offset + 1.4;
   * gesture windows stay inside their segment;
   * rest windows stay inside their segment plus at most SPILL s past its end
@@ -14,8 +17,8 @@ Sets (doc "Windows"):
   testlike   offset random in TESTLIKE (training), N_TESTLIKE per segment
   steady     gestures: offset random in STEADY_GESTURE; rest: offset 0-0.15 s;
              N_STEADY per segment (the hold without the onset, for the live check)
-  val        one per segment at 0.5 s (primary score)
-  val_late   one per segment at 0.6 s
+  val        one per segment: gestures at 0.7 s, rest at 0.5 s (primary score)
+  val_late   one per segment: gestures at 0.9 s, rest at 0.5 s
   val_steady one per segment: gestures at 1.0 s, rest at 0.0 s
 """
 from __future__ import annotations
@@ -30,12 +33,12 @@ from .io import EMG, IMU
 LENGTH = 1.4
 MIN_ROWS = 120
 SPILL = 0.25
-TESTLIKE = (0.3, 0.7)
+TESTLIKE = (0.5, 1.0)     # test gesture windows start about 0.7 s (50 Hz files) to 0.9 s (60 Hz) after the cue
 STEADY_GESTURE = (0.8, 1.5)
 STEADY_REST = (0.0, 0.15)
 N_TESTLIKE = 8
 N_STEADY = 4
-VAL_OFFSETS = {"val": (0.5, 0.5), "val_late": (0.6, 0.6), "val_steady": (1.0, 0.0)}  # (gesture, rest)
+VAL_OFFSETS = {"val": (0.7, 0.5), "val_late": (0.9, 0.5), "val_steady": (1.0, 0.0)}  # (gesture, rest)
 
 
 @dataclass(frozen=True)
