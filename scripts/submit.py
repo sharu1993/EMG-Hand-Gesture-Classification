@@ -1,11 +1,14 @@
 """Train the two-stage model (quiet/active design) on all training windows and write a Kaggle submission.
 
-    python3 scripts/submit.py --name quiet_active_tcn
+    python3 scripts/submit.py --name quiet_active_tcn                                   # pick 1
+    python3 scripts/submit.py --name quiet_active_tcn_rp --tcn-rest-pinch 3             # pick 2
 
 The active branch averages the trees with temporal conv nets (TCNs) on the
 channel-relationship frames (aura/sequence.py), 3 by default; --tcn-seeds 0
 gives the trees alone. Cross-validation, 3 repeats, gestures at 0.7 s: six-class
 macro F1 0.666 with the TCN vs 0.656 for the trees alone, better in every repeat.
+--tcn-rest-pinch N also averages N rest-vs-pinch TCNs with the trees in the quiet
+branch: 0.669 in cross-validation, but worse than without them in one of 3 repeats.
 
 Needs data/features/*.pkl (scripts/build_features.py) and, with TCNs,
 data/features/frames_relations_{train,test}.npz (scripts/build_frames.py
@@ -13,7 +16,8 @@ data/features/frames_relations_{train,test}.npz (scripts/build_frames.py
 Writes runs/<name>/:
   submission.csv   action_id,gesture in sample_submission.csv order
   models.pkl       the trained tree models (one per seed), to reproduce or deploy
-  tcn_active.pt    the trained TCNs: weights and input standardisation
+  tcn_active.pt    the trained active-gesture TCNs: weights and input standardisation
+  tcn_rest_pinch.pt  the trained rest-vs-pinch TCNs (with --tcn-rest-pinch)
   manifest.json    git commit, settings, checksums of inputs and outputs, class
                    counts, and the cross-validation scores if runs/<name>/metrics.json exists
 Refuses to overwrite an existing submission unless --force, so a scored
@@ -52,25 +56,40 @@ def git_state() -> dict:
             "uncommitted_changes": run("status", "--porcelain", "--untracked-files=no")}
 
 
-def train_active_tcns(train: pd.DataFrame, feat: Path, args, t0: float) -> dict:
-    """Train args.tcn_seeds TCNs on all active training windows (relation frames)
-    and predict the test actions. Returns the averaged test probabilities (in
-    ACTIVE order), what to save, and the device used."""
+def train_tcns(task: str, n: int, train: pd.DataFrame, feat: Path, args, t0: float) -> dict:
+    """Train n TCNs on the relation frames and predict the test actions.
+
+    task "active":     the four active gestures, on all active training windows;
+                       returns (n_test, 4) probabilities in ACTIVE order.
+    task "rest_pinch": rest vs pinch, on all pinch windows and an equal random
+                       subset of rest windows (a different subset per TCN), as
+                       the tree model; returns p(pinch) (n_test,).
+    Also returns what to save and the device used."""
     from aura.sequence import pick_device, predict_tcn, train_tcn
     ftr, fte = np.load(feat / "frames_relations_train.npz"), np.load(feat / "frames_relations_test.npz")
     if len(ftr["X"]) != len(train):
         sys.exit("frames_relations_train.npz does not match train.pkl; rerun scripts/build_frames.py --kind relations")
-    act = np.isin(train.label.to_numpy(), ACTIVE)
-    y = np.array([ACTIVE.index(l) for l in train.label.to_numpy()[act]])
+    labels = train.label.to_numpy()
     device = pick_device(args.device)
-    p, saved = np.zeros((len(fte["X"]), len(ACTIVE))), []
-    for j in range(args.tcn_seeds):
-        model, std = train_tcn(ftr["X"][act], ftr["M"][act], y, device, seed=1000 + j, epochs=args.tcn_epochs)
-        p += predict_tcn(model, std, fte["X"], fte["M"], device) / args.tcn_seeds
+    classes = ACTIVE if task == "active" else ["rest", "pinch"]
+    p, saved = 0.0, []
+    for j in range(n):
+        seed = (1000 if task == "active" else 2000) + j
+        if task == "active":
+            idx = np.flatnonzero(np.isin(labels, ACTIVE))
+            y = np.array([ACTIVE.index(l) for l in labels[idx]])
+        else:
+            ip = np.flatnonzero(labels == "pinch")
+            ir = np.random.default_rng(seed).choice(np.flatnonzero(labels == "rest"), size=len(ip), replace=False)
+            idx = np.r_[ip, ir]
+            y = (labels[idx] == "pinch").astype(int)
+        model, std = train_tcn(ftr["X"][idx], ftr["M"][idx], y, device, seed=seed, epochs=args.tcn_epochs)
+        pr = predict_tcn(model, std, fte["X"], fte["M"], device)
+        p = p + (pr if task == "active" else pr[:, 1]) / n
         saved.append({"state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
-                      "n_feat": int(ftr["X"].shape[2]), "classes": ACTIVE,
+                      "n_feat": int(ftr["X"].shape[2]), "classes": classes, "seed": seed,
                       "mu": std.mu, "sd": std.sd, "lo": std.lo})
-        print(f"TCN {j + 1}/{args.tcn_seeds} trained on {device} ({time.time() - t0:.0f} s)", flush=True)
+        print(f"{task} TCN {j + 1}/{n} trained on {device} ({time.time() - t0:.0f} s)", flush=True)
     return {"p_test": p, "saved": saved, "device": str(device)}
 
 
@@ -80,6 +99,8 @@ def main() -> None:
     ap.add_argument("--seeds", type=int, default=3, help="models trained with different seeds, probabilities averaged")
     ap.add_argument("--no-gain-aug", action="store_true")
     ap.add_argument("--tcn-seeds", type=int, default=3, help="TCNs for the active branch, averaged; 0 = trees alone")
+    ap.add_argument("--tcn-rest-pinch", type=int, default=0,
+                    help="rest-vs-pinch TCNs averaged with the trees in the quiet branch; 0 = trees alone")
     ap.add_argument("--tcn-epochs", type=int, default=40)
     ap.add_argument("--device", default="auto", help="for the TCNs: auto (Apple GPU if available), mps, cuda or cpu")
     ap.add_argument("--force", action="store_true", help="overwrite an existing submission in runs/<name>/")
@@ -101,13 +122,18 @@ def main() -> None:
         models.append(m)
         print(f"model {seed + 1}/{args.seeds} trained ({time.time() - t0:.0f} s)", flush=True)
     parts = average_parts(parts)
-    tcn = None
+    tcn = rp = None
     if args.tcn_seeds > 0:
-        tcn = train_active_tcns(train, feat, args, t0)
+        tcn = train_tcns("active", args.tcn_seeds, train, feat, args, t0)
         p_tcn = tcn.pop("p_test")
         test = test.assign(**{f"p_tcn_{g}": p_tcn[:, j] for j, g in enumerate(ACTIVE)},
                            **{f"p_trees_{g}": parts["p_active"][:, j] for j, g in enumerate(ACTIVE)})
         parts["p_active"] = (parts["p_active"] + p_tcn) / 2
+    if args.tcn_rest_pinch > 0:
+        rp = train_tcns("rest_pinch", args.tcn_rest_pinch, train, feat, args, t0)
+        p_rp = rp.pop("p_test")
+        test = test.assign(p_pinch_if_quiet_tcn=p_rp, p_pinch_if_quiet_trees=parts["p_pinch"])
+        parts["p_pinch"] = (parts["p_pinch"] + p_rp) / 2
     p6 = proba6(parts)
     test = test.assign(gesture=combine(parts), p_quiet=parts["p_quiet"], p_pinch_if_quiet=parts["p_pinch"],
                        **{f"p_{c}": p6[:, j] for j, c in enumerate(LABELS)})
@@ -120,9 +146,12 @@ def main() -> None:
     test.drop(columns=[c for c in test.columns if c[:2] in ("A_", "B_", "S_")]).to_csv(out / "test_probabilities.csv", index=False)
     with open(out / "models.pkl", "wb") as f:
         pickle.dump(models, f)
-    if tcn is not None:
+    if tcn is not None or rp is not None:
         import torch
+    if tcn is not None:
         torch.save(tcn["saved"], out / "tcn_active.pt")
+    if rp is not None:
+        torch.save(rp["saved"], out / "tcn_rest_pinch.pt")
 
     metrics = out / "metrics.json"
     manifest = {
@@ -133,12 +162,17 @@ def main() -> None:
                      "training_windows": len(train),
                      "active_tcn": None if tcn is None else {"seeds": args.tcn_seeds, "epochs": args.tcn_epochs,
                                                              "frames": "relations", "device": tcn["device"],
-                                                             "averaged_with_trees": True}},
+                                                             "averaged_with_trees": True},
+                     "rest_pinch_tcn": None if rp is None else {"seeds": args.tcn_rest_pinch, "epochs": args.tcn_epochs,
+                                                                "frames": "relations", "device": rp["device"],
+                                                                "averaged_with_trees": True}},
         "sha256": {"submission.csv": sha256(out / "submission.csv"), "models.pkl": sha256(out / "models.pkl"),
                    "train_features": sha256(feat / "train.pkl"), "test_features": sha256(feat / "test.pkl"),
-                   **({} if tcn is None else {"tcn_active.pt": sha256(out / "tcn_active.pt"),
-                                              "train_frames": sha256(feat / "frames_relations_train.npz"),
-                                              "test_frames": sha256(feat / "frames_relations_test.npz")})},
+                   **({} if tcn is None else {"tcn_active.pt": sha256(out / "tcn_active.pt")}),
+                   **({} if rp is None else {"tcn_rest_pinch.pt": sha256(out / "tcn_rest_pinch.pt")}),
+                   **({} if tcn is None and rp is None else
+                      {"train_frames": sha256(feat / "frames_relations_train.npz"),
+                       "test_frames": sha256(feat / "frames_relations_test.npz")})},
         "predicted_classes": sub.gesture.value_counts().to_dict(),
         "cv": json.loads(metrics.read_text()) if metrics.exists() else None,
     }
