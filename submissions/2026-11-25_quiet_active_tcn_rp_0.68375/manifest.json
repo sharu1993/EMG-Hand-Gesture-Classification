@@ -1,0 +1,48 @@
+{
+ "created": "2026-11-25 18:13:41",
+ "git": {
+  "commit": "577fb86efa1db089206ed99c9bc9f3e81c2afe59",
+  "branch": "work-branch",
+  "uncommitted_changes": "M scripts/submit.py"
+ },
+ "settings": {
+  "seeds": 3,
+  "design": "quiet/active",
+  "gain_aug": true,
+  "features": 250,
+  "training_windows": 20000,
+  "active_tcn": {
+   "seeds": 3,
+   "epochs": 40,
+   "frames": "relations",
+   "device": "mps",
+   "averaged_with_trees": true
+  },
+  "rest_pinch_tcn": {
+   "seeds": 3,
+   "epochs": 40,
+   "frames": "relations",
+   "device": "mps",
+   "averaged_with_trees": true
+  }
+ },
+ "sha256": {
+  "submission.csv": "28eec39c1efc06c89e6c1618a7818f62cd63602578070b1e4fb4bdd63f945098",
+  "models.pkl": "a380336322e69e691092a9ca25a7715d0401e20dc0f69f83496d622bf88b86ce",
+  "train_features": "8f4f2c4662b643e298656e71e72cbd7f39be11c64131f5816a10a886d5002cd5",
+  "test_features": "504bf897af3416e0b9a847c486fbf70a4fb6c9ecbab83a44395b4036cc246f72",
+  "tcn_active.pt": "a0c4306b76957f1ee4de5b571b8c13e8502d811546a6209b7276f177b668d57d",
+  "tcn_rest_pinch.pt": "fe80daad53ed3b24ff757518f050fc070e2388af30a7e0890f0138cf129cc73f",
+  "train_frames": "d647117f052eda565662a76ac1c986e2d7c53dfbce03cf1a491a85f0bb04413b",
+  "test_frames": "63a494046ff9536636688f4d6882de9f100ec3d2fb2c0e0c9f30d2373573ac98"
+ },
+ "predicted_classes": {
+  "rest": 186,
+  "thumb-up": 39,
+  "open": 39,
+  "point": 33,
+  "fist": 27,
+  "pinch": 24
+ },
+ "cv": null
+}
