@@ -1,0 +1,36 @@
+# Competition data (download from Kaggle; MIT license, but large and not ours to redistribute)
+vr-calibration-free-emg-challenge-pieeg/
+data/
+*.xlsx
+*.csv
+!requirements*.txt
+
+# Caches, models, outputs
+cache/
+*.pkl
+*.parquet
+*.npz
+models/
+*.onnx
+*.pt
+*.pth
+outputs/
+outputs_*/
+plots/
+*.png
+submissions/
+runs/
+wandb/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
