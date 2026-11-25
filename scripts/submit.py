@@ -1,6 +1,6 @@
-"""Train the two-stage model on all training windows and write a Kaggle submission.
+"""Train the two-stage model (quiet/active design) on all training windows and write a Kaggle submission.
 
-    python scripts/submit.py --name two_stage_baseline
+    python3 scripts/submit.py --name quiet_active
 
 Needs data/features/*.pkl (scripts/build_features.py). Writes runs/<name>/:
   submission.csv   action_id,gesture in sample_submission.csv order
@@ -26,8 +26,8 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from aura.io import GESTURES  # noqa: E402
-from aura.twostage import TwoStage, combine  # noqa: E402
+from aura.io import LABELS  # noqa: E402
+from aura.twostage import TwoStage, average_parts, combine, proba6  # noqa: E402
 
 SAMPLE = ROOT / "vr-calibration-free-emg-challenge-pieeg/sample_submission.csv"
 
@@ -45,9 +45,8 @@ def git_state() -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--name", default="two_stage_baseline")
+    ap.add_argument("--name", default="quiet_active")
     ap.add_argument("--seeds", type=int, default=3, help="models trained with different seeds, probabilities averaged")
-    ap.add_argument("--rule", choices=["gate", "soft"], default="gate")
     ap.add_argument("--no-gain-aug", action="store_true")
     ap.add_argument("--force", action="store_true", help="overwrite an existing submission in runs/<name>/")
     args = ap.parse_args()
@@ -61,17 +60,16 @@ def main() -> None:
     train = pd.read_pickle(feat / "train.pkl")
     test = pd.read_pickle(feat / "test.pkl")
 
-    models, p1s, p2s = [], [], []
+    models, parts = [], []
     for seed in range(args.seeds):
         m = TwoStage(seed=seed, gain_aug=not args.no_gain_aug).fit(train)
-        p1, p2 = m.predict_parts(test)
+        parts.append(m.predict_parts(test))
         models.append(m)
-        p1s.append(p1)
-        p2s.append(p2)
         print(f"model {seed + 1}/{args.seeds} trained ({time.time() - t0:.0f} s)", flush=True)
-    p1, p2 = np.mean(p1s, 0), np.mean(p2s, 0)
-    test = test.assign(gesture=combine(p1, p2, args.rule), p_gesture=p1,
-                       **{f"p_{g}": p2[:, j] for j, g in enumerate(GESTURES)})
+    parts = average_parts(parts)
+    p6 = proba6(parts)
+    test = test.assign(gesture=combine(parts), p_quiet=parts["p_quiet"], p_pinch_if_quiet=parts["p_pinch"],
+                       **{f"p_{c}": p6[:, j] for j, c in enumerate(LABELS)})
 
     sample = pd.read_csv(SAMPLE)
     sub = sample[["action_id"]].merge(test[["action_id", "gesture"]], on="action_id", how="left")
@@ -86,8 +84,8 @@ def main() -> None:
     manifest = {
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "git": git_state(),
-        "settings": {"seeds": args.seeds, "rule": args.rule, "gain_aug": not args.no_gain_aug,
-                     "stage1_features": len(models[0].c1), "stage2_features": len(models[0].c2),
+        "settings": {"seeds": args.seeds, "design": "quiet/active", "gain_aug": not args.no_gain_aug,
+                     "features": len(models[0].cols),
                      "training_windows": len(train)},
         "sha256": {"submission.csv": sha256(out / "submission.csv"), "models.pkl": sha256(out / "models.pkl"),
                    "train_features": sha256(feat / "train.pkl"), "test_features": sha256(feat / "test.pkl")},

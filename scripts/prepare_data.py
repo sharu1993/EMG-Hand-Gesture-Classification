@@ -1,6 +1,6 @@
 """Read the competition files once and prepare everything the models share.
 
-    python scripts/prepare_data.py
+    python3 scripts/prepare_data.py
 
 Writes
   data/cache/train.pkl, data/cache/test.pkl   parsed sessions / test actions (git-ignored)

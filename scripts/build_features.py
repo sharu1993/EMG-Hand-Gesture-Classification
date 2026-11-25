@@ -1,6 +1,6 @@
 """Compute both stages' features for every training, validation and test window.
 
-    python scripts/build_features.py            # after scripts/prepare_data.py
+    python3 scripts/build_features.py           # after scripts/prepare_data.py
 
 Writes data/features/{train,val,test}.pkl (git-ignored): one row per window,
 window metadata columns first, then the stage-1 (A_*, B_*) and stage-2 (S_*)
