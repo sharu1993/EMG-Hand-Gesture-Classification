@@ -97,7 +97,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from emg_gestures.align import align_segments  # noqa: E402
 from emg_gestures.augment import (DROP_PROBS, GAIN_SD, NOISE_SD, WARP_KNOTS, WARP_SD,  # noqa: E402
                                   augment_emg_signal, augment_imu_signal,
-                                  augment_person_signal, patch_shift, random_patch_shift)
+                                  augment_person_signal, patch_shift, random_patch_shift,
+                                  SHIFT_LEVELS)
 from emg_gestures.frames import (BAND_COLS_OF_CHANNEL, CORR_COLS_OF_CHANNEL,  # noqa: E402
                                  EMG_DIM, imu_frames, window_frames)
 from emg_gestures.riemann import riemann_frames  # noqa: E402
@@ -166,11 +167,18 @@ def _prep(job):
     e, i = preprocess(w.emg, w.imu)
     if aug_seed is not None:
         rng = np.random.default_rng(aug_seed)
-        if shift_level != "none" and rng.random() < SHIFT_PROB:
-            e = patch_shift(e, random_patch_shift(shift_level, rng), rng)
-        if person_aug:
-            e = augment_person_signal(e, rng)
-        e, i = augment_emg_signal(e, rng), augment_imu_signal(i, rng)
+        if kind == "grid":
+            # the grid network reads the samples, so gain, noise, lost contacts and
+            # patch shifts are drawn afresh every epoch on the device (augment());
+            # only the person-variation augmentation is applied here, once
+            if person_aug:
+                e = augment_person_signal(e, rng)
+        else:
+            if shift_level != "none" and rng.random() < SHIFT_PROB:
+                e = patch_shift(e, random_patch_shift(shift_level, rng), rng)
+            if person_aug:
+                e = augment_person_signal(e, rng)
+            e, i = augment_emg_signal(e, rng), augment_imu_signal(i, rng)
     if kind == "frames":
         e, i = window_frames(e, i)
     elif kind == "grid":
@@ -265,16 +273,61 @@ def _dropped_channels(B: int, gen: torch.Generator, dev) -> torch.Tensor:
     return rank < k.view(-1, 1)
 
 
-def augment(e, i, kind: str, std: Standardizer, gen: torch.Generator):
+def gpu_patch_shift(e, level: str, gen: torch.Generator):
+    """Per-window random electrode-patch shift on the device, as
+    emg_gestures.augment.patch_shift: each window gets, with probability
+    SHIFT_PROB, one shift drawn uniformly from SHIFT_LEVELS[level]."""
+    options = SHIFT_LEVELS[level]
+    B, dev = e.shape[0], e.device
+    pick = torch.randint(len(options), (B,), generator=gen, device=dev)
+    on = torch.rand(B, generator=gen, device=dev) < SHIFT_PROB
+
+    def whole_rows(x, k):
+        out = torch.zeros_like(x)
+        quiet = 0.01 * x.pow(2).mean((1, 2), keepdim=True).sqrt() * torch.randn(x.shape, generator=gen, device=dev)
+        if k == 1:
+            out[..., :6] = x[..., 2:8] - x[..., 1:2]
+            out[..., 6:] = quiet[..., 6:]
+        elif k == 2:
+            out[..., :4] = x[..., 4:8] - x[..., 3:4]
+            out[..., 4:] = quiet[..., 4:]
+        elif k == -1:
+            out[..., 2:] = x[..., :6]
+            out[..., :2] = quiet[..., :2]
+        elif k == -2:
+            out[..., 4:] = x[..., :4]
+            out[..., :4] = quiet[..., :4]
+        return out
+
+    out = e.clone()
+    for j, k in enumerate(options):
+        idx = torch.nonzero(on & (pick == j)).flatten()
+        if len(idx) == 0:
+            continue
+        x = e[idx]
+        if k == "rev":
+            y = x.flip(-1)
+        elif abs(k) == 0.5:
+            y = 0.5 * x + 0.5 * whole_rows(x, 1 if k > 0 else -1)
+        else:
+            y = whole_rows(x, k)
+        out[idx] = y
+    return out
+
+
+def augment(e, i, kind: str, std: Standardizer, gen: torch.Generator, shift_level: str = "none"):
     """Training-time augmentation on the device, in the input's own units.
-    (The riemann inputs are augmented in the signal domain when the pool is built.)"""
-    if kind in SIGNAL_AUG_KINDS:
+    (The riemann inputs are augmented in the signal domain when the pool is built;
+    the grid input here, freshly every epoch, including patch shifts.)"""
+    if kind in ("riemann", "riemann_corr"):
         return e, i
+    if kind == "grid" and shift_level != "none":
+        e = gpu_patch_shift(e, shift_level, gen)
     B, T, dev = e.shape[0], e.shape[1], e.device
     rnd = lambda *shape: torch.randn(*shape, generator=gen, device=dev)  # noqa: E731
     loggain = _log_gain_curves(B, T, gen, dev)
     dropped = _dropped_channels(B, gen, dev)
-    if kind == "raw":
+    if kind in ("raw", "grid"):
         e = e * torch.exp(loggain)                          # warped per-channel contact gain
         e = e + NOISE_SD * rnd(*e.shape)                    # sensor noise
         e = e * (~dropped).unsqueeze(1).float()             # lost contacts
@@ -348,7 +401,7 @@ def train_model(pool: Pool, idx: torch.Tensor, args, device, seed: int):
         for b in range(n_batches):
             bi = perm[b * args.batch:(b + 1) * args.batch]
             e, i, m = pool.batch(bi)
-            e, i = augment(e, i, args.input, std, gen)
+            e, i = augment(e, i, args.input, std, gen, args.shift_aug)
             e, i = std(e, i, m)
             e, i = feature_noise(e, i, args.input, gen)
             y, w = pool.y[bi], w_all[bi]
@@ -532,18 +585,21 @@ class DataCache:
               train_set: str = "steady"):
         a, t0 = self.args, time.time()
         person_aug = person_aug and kind in SIGNAL_AUG_KINDS
+        pool_shift = "none" if kind == "grid" else shift_level      # grid: shifted per epoch instead
         if shift_level != "none" and kind not in SIGNAL_AUG_KINDS:
             print(f"WARNING: --shift-aug applies to the riemann inputs only; ignored for {kind}", flush=True)
             shift_level = "none"
-        key = ("train", kind, align, person_aug, shift_level, train_set)
+        key = ("train", kind, align, person_aug, pool_shift, train_set)
         if ("val", kind) not in self._pools:
             self._pools[("val", kind)] = Pool(self.val_w, kind, self.device, a.workers)
             self._pools[("raw", kind)] = Pool(self.raw_w, kind, self.device, a.workers)
         if key not in self._pools:
             aug_seed = a.seed + 1 if kind in SIGNAL_AUG_KINDS else None   # signal-domain augmentation
+            if kind == "grid" and not person_aug:
+                aug_seed = None                                          # nothing to do at pool time
             self._pools[key] = Pool(self.train_windows(align, train_set), kind, self.device, a.workers,
                                     augment_seed=aug_seed, person_aug=person_aug,
-                                    shift_level=shift_level)
+                                    shift_level=pool_shift)
             cfg_args = argparse.Namespace(**{**vars(a), "input": kind})
             probe = build_model(kind, model_config(cfg_args))
             unit = "samples" if kind == "raw" else "frames"
