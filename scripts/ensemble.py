@@ -64,6 +64,7 @@ RANK_KEYS = {"testlike": "testlike", "balanced": "balanced", "steady": "steady_F
 # baseline.py file slugs -> its feature-set names (CONFIGS / ABLATIONS)
 BASELINE_CONFIGS = {"emg_imu": "EMG + IMU", "riemann_imu": "Riemann + IMU",
                     "riemann_corr_imu": "Riemann + Corr + IMU",
+                    "riemann_shape_corr_imu": "Riemann shape + Corr + IMU",
                     "emg_riemann_imu": "EMG + Riemann + IMU", "emg": "EMG",
                     "emg_gain": "EMG + gain", "imu": "IMU"}
 

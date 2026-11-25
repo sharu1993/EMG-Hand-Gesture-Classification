@@ -24,6 +24,10 @@ Feature groups (names are prefixed so they can be selected or ablated):
                 gyro magnitude stats
     emg_riem*   (riemann=True) multi-band covariance in the tangent space,
                 see emg_gestures/riemann.py
+    emg_rshp*, emg_rscl*
+                (riemann=True) the same covariances with each band's overall power
+                divided out (shape, 108) and those band powers (scale, 3),
+                emg_gestures.riemann.shape_scale
 """
 from __future__ import annotations
 
@@ -33,7 +37,7 @@ import numpy as np
 from scipy.signal import butter, iirnotch, sosfiltfilt, tf2sos
 
 from .riemann import feature_names as riemann_feature_names
-from .riemann import riemann_window
+from .riemann import riemann_window, shape_feature_names, shape_scale
 
 N_CH = 8
 BANDS = [(20, 45), (55, 95), (105, 125)]
@@ -147,10 +151,15 @@ def imu_features(imu: np.ndarray) -> dict[str, float]:
 def riemann_features(emg: np.ndarray, fs: float = 250.0, corr: bool = False) -> dict[str, float]:
     """Multi-band covariance tangent vectors (emg_gestures/riemann.py) of the
     filtered, gain-normalised window: emg_riem<band>_<i>_<j>, 108 values; with
-    ``corr`` also the correlation-matrix vectors emg_rcor<band>_<i>_<j>, 84 values."""
+    ``corr`` also the correlation-matrix vectors emg_rcor<band>_<i>_<j>, 84 values.
+    Always also the gain-free shape of the covariances and their band scales,
+    emg_rshp<band>_<i>_<j> (108) and emg_rscl<band> (3), from the same values."""
     y = filter_emg(emg, fs)
     y = y / (np.sqrt((y ** 2).mean()) + 1e-9)
-    return dict(zip(riemann_feature_names(corr), riemann_window(y, fs, corr).tolist()))
+    v = riemann_window(y, fs, corr)
+    out = dict(zip(riemann_feature_names(corr), v.tolist()))
+    out.update(zip(shape_feature_names(), shape_scale(v[:108]).tolist()))
+    return out
 
 
 def window_features(emg: np.ndarray, imu: np.ndarray, fs: float = 250.0,

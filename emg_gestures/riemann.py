@@ -28,6 +28,9 @@ way. R carries no per-channel power, only the co-activation pattern, which
 differs between gestures even for people whose gestures change channel power
 very little. logm(R) is kept off the diagonal only: 28 values per band, 84 for
 three bands, appended after the 108 covariance values (192 in total).
+
+Shape variant (shape_scale): each band's covariance with its overall power
+divided out (108 values), plus the 3 band powers as separate values.
 """
 from __future__ import annotations
 
@@ -76,6 +79,37 @@ def tangent(c: np.ndarray) -> np.ndarray:
     w, v = np.linalg.eigh(c)
     logc = np.einsum("...ij,...j,...kj->...ik", v, np.log(np.maximum(w, 1e-12)), v)
     return logc[..., _IU[0], _IU[1]] * _SCALE
+
+
+# positions of the 8 diagonal entries inside one band's 36 tangent values
+_DIAG_POS = np.flatnonzero(_IU[0] == _IU[1])
+
+
+def shape_scale(feats: np.ndarray) -> np.ndarray:
+    """(..., 108) covariance tangent vectors (3 bands) -> (..., 111): each band's
+    "shape" (36) followed by the 3 band scales.
+
+    Scaling a band's covariance C by s adds log(s) to every diagonal entry of
+    logm(C) and changes nothing else. With s = det(C)^(1/8) (the geometric-mean
+    eigenvalue) that shift is the mean of the 8 diagonal entries, so removing
+    it leaves the gain-free shape of C; the removed mean is the band's scale,
+    kept as its own feature. Same information as the input, but trees no
+    longer have to separate a band's overall power from the pattern across
+    channels (scripts/baseline.py, "Riemann shape + Corr + IMU")."""
+    x = np.array(feats, dtype=np.float64, copy=True)
+    scales = []
+    for b in range(len(BANDS)):
+        d = DIM_PER_BAND * b + _DIAG_POS
+        s = x[..., d].mean(axis=-1, keepdims=True)
+        x[..., d] -= s
+        scales.append(s)
+    return np.concatenate([x] + scales, axis=-1).astype(np.float32)
+
+
+def shape_feature_names() -> list[str]:
+    """Names for shape_scale: emg_rshp<band>_<i>_<j> (108), then emg_rscl<band> (3)."""
+    names = [f"emg_rshp{lo}_{hi}_{i + 1}_{j + 1}" for lo, hi in BANDS for i, j in zip(*_IU)]
+    return names + [f"emg_rscl{lo}_{hi}" for lo, hi in BANDS]
 
 
 def corr_tangent(c: np.ndarray) -> np.ndarray:

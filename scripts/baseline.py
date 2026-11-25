@@ -70,14 +70,18 @@ META = ("label", "session", "length_s", "offset_s", "sample_id")
 
 # Feature-name prefixes: emg_riem = covariance tangent vectors, emg_rcor = the
 # same covariances as correlation matrices (pattern only), emg_ = other EMG
-# features, imu_ = IMU features (emg_gestures/features.py).
-_RIEM = ("emg_riem", "emg_rcor")
+# features, imu_ = IMU features (emg_gestures/features.py). emg_rshp / emg_rscl =
+# the covariances with each band's power divided out, and those band powers
+# (emg_gestures.riemann.shape_scale); only "Riemann shape + Corr + IMU" uses them.
+_SHAPE = ("emg_rshp", "emg_rscl")
+_RIEM = ("emg_riem", "emg_rcor") + _SHAPE
 CONFIGS = {
     # name: feature-name filter
     "EMG + IMU": lambda c: c != "emg_gain" and not c.startswith(_RIEM),
     "Riemann + IMU": lambda c: c.startswith("emg_riem") or c.startswith("imu_"),
-    "Riemann + Corr + IMU": lambda c: c.startswith(_RIEM) or c.startswith("imu_"),
-    "EMG + Riemann + IMU": lambda c: c != "emg_gain" and not c.startswith("emg_rcor"),
+    "Riemann + Corr + IMU": lambda c: c.startswith(("emg_riem", "emg_rcor")) or c.startswith("imu_"),
+    "EMG + Riemann + IMU": lambda c: c != "emg_gain" and not c.startswith(("emg_rcor",) + _SHAPE),
+    "Riemann shape + Corr + IMU": lambda c: c.startswith(_SHAPE + ("emg_rcor",)) or c.startswith("imu_"),
 }
 ABLATIONS = {
     "EMG": lambda c: c.startswith("emg_") and c != "emg_gain" and not c.startswith(_RIEM),
