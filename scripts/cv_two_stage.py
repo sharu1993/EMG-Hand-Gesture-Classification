@@ -6,6 +6,8 @@
     python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active_aug60 --aug60 --baseline quiet_active
     python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active_car --car --baseline quiet_active
     python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active_td --td --baseline quiet_active
+    python3 scripts/cv_two_stage.py --repeats 0 1 2 --name car_qp --car --car-models quiet,pinch --val-aug augch
+    python3 scripts/cv_two_stage.py --repeats 0 1 2 --name car_qp_augch --car --car-models quiet,pinch --aug augch --val-aug augch
 
 Needs data/features/*.pkl (scripts/build_features.py). Prints, averaged over the
 repeats: stage 1 (quiet vs active), the rest-vs-pinch model on true rest and
@@ -21,8 +23,13 @@ windows (data/features/aug60_train.pkl, from scripts/build_aug60.py) to the
 training data of all three models; in each fold it drops those whose window or
 noise comes from a held-out session. --car adds the common-average-reference
 features (data/features/car_*.pkl, from scripts/build_car_features.py) to all
-three models; --td the time-domain features (data/features/td_*.pkl, from
-scripts/build_td_features.py) to all three. --baseline NAME prints the change against
+three models (--car-models to choose which); --td the time-domain features (data/features/td_*.pkl, from
+scripts/build_td_features.py) to all three. --aug NAME adds the windows in
+data/features/NAME_train.pkl to the training data of every fold (--aug60 is
+--aug aug60), dropping those from held-out sessions. --val-aug NAME also
+predicts the corrupted copies of the validation windows in
+data/features/NAME_val.pkl (scripts/build_aug_channel.py) with each fold's
+models and scores them as a stress test. --baseline NAME prints the change against
 runs/NAME/metrics.json, repeat by repeat (same seeds and windows).
 """
 from __future__ import annotations
@@ -51,20 +58,32 @@ def macro_f1(y, p):
     return f1_score(y, p, labels=LABELS, average="macro", zero_division=0)
 
 
-def run_repeat(train, val, folds, seed, gain_aug, extra=(), aug=None, extra_for=("quiet", "active")):
-    parts = {"p_quiet": np.full(len(val), np.nan), "p_pinch": np.full(len(val), np.nan),
-             "p_active": np.full((len(val), len(ACTIVE)), np.nan)}
+def _empty(n):
+    return {"p_quiet": np.full(n, np.nan), "p_pinch": np.full(n, np.nan), "p_active": np.full((n, len(ACTIVE)), np.nan)}
+
+
+def run_repeat(train, val, folds, seed, gain_aug, extra=(), aug=None, extra_for=("quiet", "active"), val_aug=None):
+    """Out-of-fold parts for val (and, with val_aug, for its corrupted copy)."""
+    parts = _empty(len(val))
+    parts_aug = _empty(len(val)) if val_aug is not None else None
     for fo in folds:
         tr = ~train.session.isin(fo)
         va = val.session.isin(fo).to_numpy()
         fit_on = train[tr]
         if aug is not None:
-            keep = ~aug.session.isin(fo) & ~aug.noise_session.isin(fo)
+            keep = ~aug.session.isin(fo)
+            if "noise_session" in aug.columns:
+                keep &= ~aug.noise_session.isin(fo)
             fit_on = pd.concat([fit_on, aug.loc[keep, train.columns]], ignore_index=True)
-        p = TwoStage(seed=seed, gain_aug=gain_aug, extra=extra, extra_for=extra_for).fit(fit_on).predict_parts(val[va])
+        m = TwoStage(seed=seed, gain_aug=gain_aug, extra=extra, extra_for=extra_for).fit(fit_on)
+        p = m.predict_parts(val[va])
         for k in PARTS:
             parts[k][va] = p[k]
-    return parts
+        if val_aug is not None:
+            p = m.predict_parts(val_aug[va])
+            for k in PARTS:
+                parts_aug[k][va] = p[k]
+    return parts, parts_aug
 
 
 def score(val, parts, setup):
@@ -102,6 +121,10 @@ def main() -> None:
     ap.add_argument("--aug60", action="store_true", help="add the simulated 60 Hz-like training windows")
     ap.add_argument("--car", action="store_true", help="add the common-average-reference features to all three models")
     ap.add_argument("--td", action="store_true", help="add the time-domain features to all three models")
+    ap.add_argument("--car-models", default="quiet,pinch,active",
+                    help="with --car: the models that get the C features (quiet = stage 1, pinch, active)")
+    ap.add_argument("--aug", help="add data/features/<NAME>_train.pkl to the training data (e.g. augch)")
+    ap.add_argument("--val-aug", help="also score the corrupted validation windows in data/features/<NAME>_val.pkl")
     ap.add_argument("--baseline", help="runs/<name> to compare with, repeat by repeat")
     args = ap.parse_args()
 
@@ -114,8 +137,8 @@ def main() -> None:
     for flag, file, prefix, models, script, what in (
             (args.imu, "imu", "I_", ("quiet", "active"), "build_imu_features.py",
              "per-axis IMU features to stage 1 and the active branch"),
-            (args.car, "car", "C_", ("quiet", "pinch", "active"), "build_car_features.py",
-             "common-average-reference features to all three models"),
+            (args.car, "car", "C_", tuple(args.car_models.split(",")), "build_car_features.py",
+             f"common-average-reference features to {args.car_models}"),
             (args.td, "td", "T_", ("quiet", "pinch", "active"), "build_td_features.py",
              "time-domain features to all three models")):
         if not flag:
@@ -131,29 +154,49 @@ def main() -> None:
         val = pd.concat([val, add["val"][cols]], axis=1)
         extra, extra_for = (prefix,), models
         print(f"added {len(cols)} {what}", flush=True)
-    aug = None
+    if set(tuple(args.car_models.split(","))) - {"quiet", "pinch", "active"}:
+        sys.exit("--car-models takes a comma list of quiet, pinch, active")
     if args.aug60:
-        if args.imu or args.car or args.td:
-            sys.exit("--aug60 cannot be combined with --imu, --car or --td (the simulated windows have only A, B, S features)")
-        aug = pd.read_pickle(ROOT / "data/features/aug60_train.pkl")
+        if args.aug and args.aug != "aug60":
+            sys.exit("use one of --aug60 and --aug")
+        args.aug = "aug60"
+    aug = val_aug = None
+    if args.aug:
+        aug = pd.read_pickle(ROOT / f"data/features/{args.aug}_train.pkl")
         missing = [c for c in train.columns if c not in aug.columns]
         if missing:
-            sys.exit(f"aug60_train.pkl lacks {len(missing)} columns of train.pkl; rerun scripts/build_aug60.py")
-        print(f"simulated 60 Hz-like windows: {len(aug)} (dropped per fold when their window or noise is held out)",
-              flush=True)
+            sys.exit(f"{args.aug}_train.pkl lacks {len(missing)} of the training columns (e.g. {missing[0]}); rebuild it")
+        print(f"extra training windows from {args.aug}_train.pkl: {len(aug)} (dropped per fold when held out)", flush=True)
+    if args.val_aug:
+        val_aug = pd.read_pickle(ROOT / f"data/features/{args.val_aug}_val.pkl")
+        meta = ["session", "seg", "label", "kind", "offset", "n_rows"]
+        if len(val_aug) != len(val) or not (val_aug[meta].to_numpy() == val[meta].to_numpy()).all():
+            sys.exit(f"{args.val_aug}_val.pkl does not match val.pkl's windows; rebuild it")
+        missing = [c for c in val.columns if c not in val_aug.columns]
+        if missing:
+            sys.exit(f"{args.val_aug}_val.pkl lacks {len(missing)} of the validation columns (e.g. {missing[0]})")
+        val_aug = val_aug[list(val.columns)]
+        print(f"stress test: {len(val_aug)} corrupted validation windows from {args.val_aug}_val.pkl", flush=True)
     cfg = read_folds(ROOT / "config/folds.json")
     out_dir = ROOT / "runs" / args.name
     out_dir.mkdir(parents=True, exist_ok=True)
-    allm = {}
+    allm, allm_aug = {}, {}
     for rep in args.repeats:
-        parts = run_repeat(train, val, cfg["repeats"][rep], seed=rep, gain_aug=not args.no_gain_aug, extra=extra, aug=aug,
-                           extra_for=extra_for)
+        parts, parts_aug = run_repeat(train, val, cfg["repeats"][rep], seed=rep, gain_aug=not args.no_gain_aug,
+                                      extra=extra, aug=aug, extra_for=extra_for, val_aug=val_aug)
         oof = val[["session", "seg", "label", "kind", "offset"]].copy()
         oof["p_quiet"], oof["p_pinch"] = parts["p_quiet"], parts["p_pinch"]
         for j, g in enumerate(ACTIVE):
             oof[f"p_{g}"] = parts["p_active"][:, j]
         oof.to_pickle(out_dir / f"oof_repeat{rep}.pkl")
         allm[rep] = score(val, parts, cfg["setup_hz"])
+        if parts_aug is not None:
+            oa = val[["session", "seg", "label", "kind", "offset"]].copy()
+            oa["p_quiet"], oa["p_pinch"] = parts_aug["p_quiet"], parts_aug["p_pinch"]
+            for j, g in enumerate(ACTIVE):
+                oa[f"p_{g}"] = parts_aug["p_active"][:, j]
+            oa.to_pickle(out_dir / f"oof_valaug_repeat{rep}.pkl")
+            allm_aug[rep] = score(val, parts_aug, cfg["setup_hz"])
         print(f"repeat {rep} done ({time.time() - t0:.0f} s)", flush=True)
 
     print("\nMean over repeats", args.repeats, "(sessions held out)")
@@ -161,6 +204,11 @@ def main() -> None:
     print(tab.round(3).to_string())
     if len(allm) > 1:
         print("\nsix-class F1 per repeat, gestures at 0.7 s:", [round(allm[r]["val"]["F1"], 3) for r in allm])
+    if allm_aug:
+        print(f"\nSTRESS TEST: the same windows with one bad electrode ({args.val_aug}_val.pkl), mean over repeats")
+        tab = pd.DataFrame({kind: pd.DataFrame([allm_aug[r][kind] for r in allm_aug]).mean() for kind in KINDS})
+        print(tab.round(3).to_string())
+        print("six-class F1 per repeat, gestures at 0.7 s:", [round(allm_aug[r]["val"]["F1"], 3) for r in allm_aug])
 
     rep = args.repeats[0]
     oof = pd.read_pickle(out_dir / f"oof_repeat{rep}.pkl")
@@ -174,7 +222,9 @@ def main() -> None:
     print(pd.DataFrame(confusion_matrix(y, pred, labels=LABELS), index=LABELS, columns=LABELS).to_string())
     (out_dir / "metrics.json").write_text(json.dumps({"repeats": {str(r): m for r, m in allm.items()},
                                                       "gain_aug": not args.no_gain_aug, "extra": list(extra),
-                                                      "aug60": bool(args.aug60), "extra_for": list(extra_for) if extra else []}, indent=1))
+                                                      "aug60": bool(args.aug60), "aug": args.aug, "val_aug": args.val_aug,
+                                                      "extra_for": list(extra_for) if extra else [],
+                                                      "stress_repeats": {str(r): m for r, m in allm_aug.items()}}, indent=1))
     if args.baseline:
         base = json.loads((ROOT / "runs" / args.baseline / "metrics.json").read_text())["repeats"]
         keys = ["stage1_BA", "stage1_AUC", "active_F1", "F1", "F1_50Hz", "F1_60Hz", "pinch_F1"]
