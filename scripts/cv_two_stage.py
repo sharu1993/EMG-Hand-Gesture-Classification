@@ -62,20 +62,22 @@ def _empty(n):
     return {"p_quiet": np.full(n, np.nan), "p_pinch": np.full(n, np.nan), "p_active": np.full((n, len(ACTIVE)), np.nan)}
 
 
-def run_repeat(train, val, folds, seed, gain_aug, extra=(), aug=None, extra_for=("quiet", "active"), val_aug=None):
+def run_repeat(train, val, folds, seed, gain_aug, extra=(), aug=None, extra_for=("quiet", "active"), val_aug=None,
+               aug_for=("quiet", "pinch", "active")):
     """Out-of-fold parts for val (and, with val_aug, for its corrupted copy)."""
     parts = _empty(len(val))
     parts_aug = _empty(len(val)) if val_aug is not None else None
     for fo in folds:
         tr = ~train.session.isin(fo)
         va = val.session.isin(fo).to_numpy()
-        fit_on = train[tr]
+        aug_fold = None
         if aug is not None:
             keep = ~aug.session.isin(fo)
             if "noise_session" in aug.columns:
                 keep &= ~aug.noise_session.isin(fo)
-            fit_on = pd.concat([fit_on, aug.loc[keep, train.columns]], ignore_index=True)
-        m = TwoStage(seed=seed, gain_aug=gain_aug, extra=extra, extra_for=extra_for).fit(fit_on)
+            aug_fold = aug.loc[keep, train.columns]
+        m = TwoStage(seed=seed, gain_aug=gain_aug, extra=extra, extra_for=extra_for,
+                     aug_for=aug_for).fit(train[tr], aug_fold)
         p = m.predict_parts(val[va])
         for k in PARTS:
             parts[k][va] = p[k]
@@ -124,6 +126,8 @@ def main() -> None:
     ap.add_argument("--car-models", default="quiet,pinch,active",
                     help="with --car: the models that get the C features (quiet = stage 1, pinch, active)")
     ap.add_argument("--aug", help="add data/features/<NAME>_train.pkl to the training data (e.g. augch)")
+    ap.add_argument("--aug-models", default="quiet,pinch,active",
+                    help="with --aug: the models that get the extra windows (quiet = stage 1, pinch, active)")
     ap.add_argument("--val-aug", help="also score the corrupted validation windows in data/features/<NAME>_val.pkl")
     ap.add_argument("--baseline", help="runs/<name> to compare with, repeat by repeat")
     args = ap.parse_args()
@@ -183,7 +187,8 @@ def main() -> None:
     allm, allm_aug = {}, {}
     for rep in args.repeats:
         parts, parts_aug = run_repeat(train, val, cfg["repeats"][rep], seed=rep, gain_aug=not args.no_gain_aug,
-                                      extra=extra, aug=aug, extra_for=extra_for, val_aug=val_aug)
+                                      extra=extra, aug=aug, extra_for=extra_for, val_aug=val_aug,
+                                      aug_for=tuple(args.aug_models.split(",")))
         oof = val[["session", "seg", "label", "kind", "offset"]].copy()
         oof["p_quiet"], oof["p_pinch"] = parts["p_quiet"], parts["p_pinch"]
         for j, g in enumerate(ACTIVE):
@@ -222,7 +227,8 @@ def main() -> None:
     print(pd.DataFrame(confusion_matrix(y, pred, labels=LABELS), index=LABELS, columns=LABELS).to_string())
     (out_dir / "metrics.json").write_text(json.dumps({"repeats": {str(r): m for r, m in allm.items()},
                                                       "gain_aug": not args.no_gain_aug, "extra": list(extra),
-                                                      "aug60": bool(args.aug60), "aug": args.aug, "val_aug": args.val_aug,
+                                                      "aug60": bool(args.aug60), "aug": args.aug, "aug_models": args.aug_models if args.aug else None,
+                                                      "val_aug": args.val_aug,
                                                       "extra_for": list(extra_for) if extra else [],
                                                       "stress_repeats": {str(r): m for r, m in allm_aug.items()}}, indent=1))
     if args.baseline:

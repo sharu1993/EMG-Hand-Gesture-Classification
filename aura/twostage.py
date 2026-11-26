@@ -51,11 +51,15 @@ def gain_augment(X: np.ndarray, cols: list[str], rng: np.random.Generator) -> np
 
 class TwoStage:
     """extra: further feature prefixes (e.g. ("I_",)), given only to the models
-    named in extra_for ("quiet" = stage 1, "pinch" = rest vs pinch, "active")."""
+    named in extra_for ("quiet" = stage 1, "pinch" = rest vs pinch, "active").
+    fit(train, aug): aug holds extra training windows (e.g. the one-bad-electrode
+    copies, scripts/build_aug_channel.py), added only to the models in aug_for."""
 
-    def __init__(self, seed: int = 0, gain_aug: bool = True, extra: tuple = (), extra_for: tuple = ("quiet", "active")):
+    def __init__(self, seed: int = 0, gain_aug: bool = True, extra: tuple = (), extra_for: tuple = ("quiet", "active"),
+                 aug_for: tuple = ("quiet", "pinch", "active")):
         self.seed, self.gain_aug = seed, gain_aug
         self.extra, self.extra_for = tuple(extra), tuple(extra_for)
+        self.aug_for = tuple(aug_for)
 
     def _cols(self, model: str) -> list[str]:
         cm = getattr(self, "cols_m", None)            # models saved before per-model columns use self.cols
@@ -68,23 +72,33 @@ class TwoStage:
             X = gain_augment(X, cols, np.random.default_rng(aug_seed))
         return X
 
-    def fit(self, train: pd.DataFrame) -> "TwoStage":
+    def fit(self, train: pd.DataFrame, aug: pd.DataFrame | None = None) -> "TwoStage":
+        base = train
+        if aug is not None:
+            missing = [c for c in train.columns if c not in aug.columns]
+            if missing:
+                raise ValueError(f"aug lacks {len(missing)} training columns, e.g. {missing[0]}")
+            both = pd.concat([train, aug[list(train.columns)]], ignore_index=True)
+        data = {m: (both if aug is not None and m in self.aug_for else base) for m in ("quiet", "pinch", "active")}
         self.cols = feature_cols(train)
         more = feature_cols(train, self.extra) if self.extra else []
         if self.extra and not more:
             raise ValueError(f"no columns with prefixes {self.extra}")
         self.cols_m = {m: self.cols + (more if m in self.extra_for else []) for m in ("quiet", "pinch", "active")}
-        lab = train["label"].to_numpy()
         s = self.seed
         # stage 1: quiet vs active, all windows
-        self.m_quiet = _trees(s).fit(self._x(train, "quiet", s), np.isin(lab, QUIET).astype(int))
+        d = data["quiet"]
+        self.m_quiet = _trees(s).fit(self._x(d, "quiet", s), np.isin(d["label"].to_numpy(), QUIET).astype(int))
         # quiet branch: rest vs pinch on equal numbers of each
+        d = data["pinch"]
+        lab = d["label"].to_numpy()
         ip = np.flatnonzero(lab == "pinch")
         ir = np.random.default_rng(s + 1).choice(np.flatnonzero(lab == "rest"), size=len(ip), replace=False)
-        q = train.iloc[np.r_[ip, ir]]
+        q = d.iloc[np.r_[ip, ir]]
         self.m_pinch = _trees(s).fit(self._x(q, "pinch", s + 2), (q["label"] == "pinch").to_numpy().astype(int))
         # active branch: four gestures
-        a = train[np.isin(lab, ACTIVE)]
+        d = data["active"]
+        a = d[np.isin(d["label"].to_numpy(), ACTIVE)]
         self.m_active = _trees(s).fit(self._x(a, "active"), a["label"].to_numpy())
         self.order_active = [list(self.m_active.classes_).index(c) for c in ACTIVE]
         return self

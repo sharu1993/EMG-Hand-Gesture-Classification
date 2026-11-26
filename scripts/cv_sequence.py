@@ -5,6 +5,10 @@ on the fixed session folds, and score it in the chain against the trees.
     python3 scripts/cv_sequence.py --repeats 0 1 2 --frames relations --task rest_pinch
     python3 scripts/cv_sequence.py --repeats 0 1 2 --frames relations --task quiet
     python3 scripts/cv_sequence.py --repeats 0 1 2 --frames relations_car --task rest_pinch --seeds 3
+    python3 scripts/cv_sequence.py --repeats 0 1 2 --frames relations --task active --seeds 3 \
+        --val-aug-frames augch --name tcn_active_relations_stress                  # current TCN, stress test
+    python3 scripts/cv_sequence.py --repeats 0 1 2 --frames relations --task active --seeds 3 \
+        --aug-frames augch --val-aug-frames augch --name tcn_active_relations_augch
 
 Tasks (each trained the same way as the matching tree model in aura/twostage.py):
   active      fist / open / point / thumb-up, on active windows            -> p_active
@@ -20,6 +24,12 @@ For the chosen decision, prints the trees alone, the TCN alone and the average
 of the two (the other two decisions stay the trees'): the decision's own score
 and the chained six-class macro F1, averaged over repeats and per repeat.
 Writes runs/<name>/seq_oof_repeat<r>.pkl and summary.csv.
+
+--aug-frames NAME adds, in each fold, the one-bad-electrode copies of the same
+training windows (data/features/frames_<frames>_NAME_train.npz, from
+scripts/build_frames.py --corrupt NAME) with the same labels. --val-aug-frames
+NAME also predicts the corrupted validation windows (stress test) and writes
+runs/<name>/seq_oof_valaug_repeat<r>.pkl.
 """
 from __future__ import annotations
 
@@ -80,6 +90,8 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--seeds", type=int, default=1, help="TCNs per fold, probabilities averaged")
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--aug-frames", help="add the corrupted copies of the training windows (e.g. augch)")
+    ap.add_argument("--val-aug-frames", help="also predict the corrupted validation windows (e.g. augch)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -94,6 +106,17 @@ def main() -> None:
             (f"tcn_active_{args.frames}" if args.task == "active" else f"tcn_{args.task}_{args.frames}")
     ftr, fva = np.load(feat / f"{prefix}train.npz"), np.load(feat / f"{prefix}val.npz")
     Xtr, Mtr, Xva, Mva = ftr["X"], ftr["M"], fva["X"], fva["M"]
+    Xau = Mau = Xvs = Mvs = None
+    if args.aug_frames:
+        fa = np.load(feat / f"{prefix}{args.aug_frames}_train.npz")
+        Xau, Mau = fa["X"], fa["M"]
+        if Xau.shape != Xtr.shape:
+            sys.exit(f"{prefix}{args.aug_frames}_train.npz does not match {prefix}train.npz")
+    if args.val_aug_frames:
+        fs = np.load(feat / f"{prefix}{args.val_aug_frames}_val.npz")
+        Xvs, Mvs = fs["X"], fs["M"]
+        if Xvs.shape != Xva.shape:
+            sys.exit(f"{prefix}{args.val_aug_frames}_val.npz does not match {prefix}val.npz")
     cfg = read_folds(ROOT / "config/folds.json")
     out = ROOT / "runs" / args.name
     out.mkdir(parents=True, exist_ok=True)
@@ -111,16 +134,22 @@ def main() -> None:
         tree_parts = {"p_quiet": trees.p_quiet.to_numpy(), "p_pinch": trees.p_pinch.to_numpy(),
                       "p_active": trees[[f"p_{g}" for g in ACTIVE]].to_numpy()}
         p_seq = np.zeros_like(tree_parts[part], dtype=float)
+        p_str = np.zeros_like(tree_parts[part], dtype=float) if Xvs is not None else None
         for k, fo in enumerate(cfg["repeats"][rep]):
             trm = ~tr_meta.session.isin(fo).to_numpy()
             va = va_meta.session.isin(fo).to_numpy()
             for j in range(args.seeds):
                 seed = rep * 100 + k * 10 + j
                 idx, yc = train_rows(args.task, labels, trm, np.random.default_rng(seed))
-                model, std = train_tcn(Xtr[idx], Mtr[idx], yc, device, seed=seed, epochs=args.epochs,
-                                       verbose=args.verbose)
+                Xf, Mf, yf = Xtr[idx], Mtr[idx], yc
+                if Xau is not None:                     # the same windows with one bad electrode, same labels
+                    Xf, Mf, yf = np.concatenate([Xf, Xau[idx]]), np.concatenate([Mf, Mau[idx]]), np.r_[yc, yc]
+                model, std = train_tcn(Xf, Mf, yf, device, seed=seed, epochs=args.epochs, verbose=args.verbose)
                 pr = predict_tcn(model, std, Xva[va], Mva[va], device)
                 p_seq[va] += (pr if args.task == "active" else pr[:, 1]) / args.seeds
+                if Xvs is not None:
+                    pr = predict_tcn(model, std, Xvs[va], Mvs[va], device)
+                    p_str[va] += (pr if args.task == "active" else pr[:, 1]) / args.seeds
             print(f"repeat {rep} fold {k + 1}/{len(cfg['repeats'][rep])} ({time.time() - t0:.0f} s)", flush=True)
         oof = va_meta.copy()
         if args.task == "active":
@@ -129,6 +158,17 @@ def main() -> None:
         else:
             oof[part] = p_seq
         oof.to_pickle(out / f"seq_oof_repeat{rep}.pkl")
+        if p_str is not None:
+            os_ = va_meta.copy()
+            if args.task == "active":
+                for j, g in enumerate(ACTIVE):
+                    os_[f"p_{g}"] = p_str[:, j]
+            else:
+                os_[part] = p_str
+            os_.to_pickle(out / f"seq_oof_valaug_repeat{rep}.pkl")
+            kk = (va_meta.kind == "val").to_numpy()
+            print(f"repeat {rep} TCN alone, gestures at 0.7 s: clean {decision_score(args.task, y, p_seq, kk)}, "
+                  f"one bad electrode {decision_score(args.task, y, p_str, kk)}", flush=True)
         for name, p in (("trees", tree_parts[part]), ("TCN", p_seq), ("average", (tree_parts[part] + p_seq) / 2)):
             parts = dict(tree_parts, **{part: p})
             pred = combine(parts)

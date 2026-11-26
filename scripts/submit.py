@@ -3,6 +3,7 @@
     python3 scripts/submit.py --name quiet_active_tcn                                   # pick 1
     python3 scripts/submit.py --name quiet_active_tcn_rp --tcn-rest-pinch 3             # 0.68375
     python3 scripts/submit.py --name car_tcn_rp --tcn-rest-pinch 3 --car                # + CAR features
+    python3 scripts/submit.py --name car_augch_tcn_rp --tcn-rest-pinch 3 --car --aug-channel
 
 The active branch averages the trees with temporal conv nets (TCNs) on the
 channel-relationship frames (aura/sequence.py), 3 by default; --tcn-seeds 0
@@ -14,6 +15,12 @@ branch: 0.669 in cross-validation, but worse than without them in one of 3 repea
 scripts/build_car_features.py) to stage 1 and the rest-vs-pinch trees, not the
 active branch: full model 0.686 at 0.7 s and 0.680 at 0.9 s in cross-validation,
 +0.017 and +0.020, better in every repeat (25 Nov 2026).
+--aug-channel adds the one-bad-electrode copies of the training windows
+(data/features/augch_train.pkl, scripts/build_aug_channel.py) to the stage-1
+and active trees, and their frames (frames_relations_augch_train.npz,
+scripts/build_frames.py --corrupt augch) to the active TCNs; not to rest vs
+pinch. Cross-validation, full model with 1-seed TCNs: -0.004 / -0.002 at
+0.7 / 0.9 s, but with one bad electrode 0.611 instead of 0.392 (26 Nov 2026).
 
 Needs data/features/*.pkl (scripts/build_features.py) and, with TCNs,
 data/features/frames_relations_{train,test}.npz (scripts/build_frames.py
@@ -47,6 +54,7 @@ sys.path.insert(0, str(ROOT))
 from aura.io import LABELS  # noqa: E402
 from aura.twostage import ACTIVE, TwoStage, average_parts, combine, proba6  # noqa: E402
 
+AUG_FOR = ("quiet", "active")      # the models that get the one-bad-electrode windows (--aug-channel)
 SAMPLE = ROOT / "vr-calibration-free-emg-challenge-pieeg/sample_submission.csv"
 
 
@@ -69,11 +77,19 @@ def train_tcns(task: str, n: int, train: pd.DataFrame, feat: Path, args, t0: flo
     task "rest_pinch": rest vs pinch, on all pinch windows and an equal random
                        subset of rest windows (a different subset per TCN), as
                        the tree model; returns p(pinch) (n_test,).
+    With --aug-channel, the active TCNs also train on the one-bad-electrode copies
+    of their windows (frames_relations_augch_train.npz, same labels).
     Also returns what to save and the device used."""
     from aura.sequence import pick_device, predict_tcn, train_tcn
     ftr, fte = np.load(feat / "frames_relations_train.npz"), np.load(feat / "frames_relations_test.npz")
     if len(ftr["X"]) != len(train):
         sys.exit("frames_relations_train.npz does not match train.pkl; rerun scripts/build_frames.py --kind relations")
+    fau = None
+    if task == "active" and args.aug_channel:
+        fau = np.load(feat / "frames_relations_augch_train.npz")
+        if fau["X"].shape != ftr["X"].shape:
+            sys.exit("frames_relations_augch_train.npz does not match; "
+                     "rerun scripts/build_frames.py --kind relations --corrupt augch")
     labels = train.label.to_numpy()
     device = pick_device(args.device)
     classes = ACTIVE if task == "active" else ["rest", "pinch"]
@@ -88,7 +104,10 @@ def train_tcns(task: str, n: int, train: pd.DataFrame, feat: Path, args, t0: flo
             ir = np.random.default_rng(seed).choice(np.flatnonzero(labels == "rest"), size=len(ip), replace=False)
             idx = np.r_[ip, ir]
             y = (labels[idx] == "pinch").astype(int)
-        model, std = train_tcn(ftr["X"][idx], ftr["M"][idx], y, device, seed=seed, epochs=args.tcn_epochs)
+        X, M = ftr["X"][idx], ftr["M"][idx]
+        if fau is not None:
+            X, M, y = np.concatenate([X, fau["X"][idx]]), np.concatenate([M, fau["M"][idx]]), np.r_[y, y]
+        model, std = train_tcn(X, M, y, device, seed=seed, epochs=args.tcn_epochs)
         pr = predict_tcn(model, std, fte["X"], fte["M"], device)
         p = p + (pr if task == "active" else pr[:, 1]) / n
         saved.append({"state_dict": {k: v.detach().cpu() for k, v in model.state_dict().items()},
@@ -108,6 +127,8 @@ def main() -> None:
                     help="rest-vs-pinch TCNs averaged with the trees in the quiet branch; 0 = trees alone")
     ap.add_argument("--tcn-epochs", type=int, default=40)
     ap.add_argument("--device", default="auto", help="for the TCNs: auto (Apple GPU if available), mps, cuda or cpu")
+    ap.add_argument("--aug-channel", action="store_true",
+                    help="train stage 1, the active trees and the active TCNs also on the one-bad-electrode copies")
     ap.add_argument("--car", action="store_true",
                     help="add the common-average-reference features to stage 1 and the rest-vs-pinch trees")
     ap.add_argument("--force", action="store_true", help="overwrite an existing submission in runs/<name>/")
@@ -121,6 +142,13 @@ def main() -> None:
     feat = ROOT / "data/features"
     train = pd.read_pickle(feat / "train.pkl")
     test = pd.read_pickle(feat / "test.pkl")
+    aug = None
+    if args.aug_channel:
+        aug = pd.read_pickle(feat / "augch_train.pkl")
+        meta = ["session", "seg", "label", "kind", "offset", "n_rows"]
+        if len(aug) != len(train) or not (aug[meta].to_numpy() == train[meta].to_numpy()).all():
+            sys.exit("augch_train.pkl does not match train.pkl; rerun scripts/build_aug_channel.py")
+        print(f"adding {len(aug)} one-bad-electrode windows to stage 1 and the active trees", flush=True)
     extra, extra_for = (), ()
     if args.car:
         ctr, cte = pd.read_pickle(feat / "car_train.pkl"), pd.read_pickle(feat / "car_test.pkl")
@@ -137,7 +165,8 @@ def main() -> None:
 
     models, parts = [], []
     for seed in range(args.seeds):
-        m = TwoStage(seed=seed, gain_aug=not args.no_gain_aug, extra=extra, extra_for=extra_for).fit(train)
+        m = TwoStage(seed=seed, gain_aug=not args.no_gain_aug, extra=extra, extra_for=extra_for,
+                     aug_for=AUG_FOR).fit(train, aug)
         parts.append(m.predict_parts(test))
         models.append(m)
         print(f"model {seed + 1}/{args.seeds} trained ({time.time() - t0:.0f} s)", flush=True)
@@ -179,6 +208,8 @@ def main() -> None:
         "git": git_state(),
         "settings": {"seeds": args.seeds, "design": "quiet/active", "gain_aug": not args.no_gain_aug,
                      "features": len(models[0].cols),
+                     "aug_channel": None if aug is None else {"windows": len(aug), "models": list(AUG_FOR),
+                                                               "active_tcn": tcn is not None},
                      "extra_features": None if not extra else {"prefixes": list(extra), "models": list(extra_for),
                                                                "count": len(cols)},
                      "training_windows": len(train),
@@ -190,6 +221,9 @@ def main() -> None:
                                                                 "averaged_with_trees": True}},
         "sha256": {"submission.csv": sha256(out / "submission.csv"), "models.pkl": sha256(out / "models.pkl"),
                    "train_features": sha256(feat / "train.pkl"), "test_features": sha256(feat / "test.pkl"),
+                   **({} if aug is None else {"augch_train": sha256(feat / "augch_train.pkl"),
+                                              **({} if tcn is None else
+                                                 {"augch_frames": sha256(feat / "frames_relations_augch_train.npz")})}),
                    **({} if not extra else {"car_train": sha256(feat / "car_train.pkl"),
                                             "car_test": sha256(feat / "car_test.pkl")}),
                    **({} if tcn is None else {"tcn_active.pt": sha256(out / "tcn_active.pt")}),
