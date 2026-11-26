@@ -1,7 +1,8 @@
 """Train the two-stage model (quiet/active design) on all training windows and write a Kaggle submission.
 
     python3 scripts/submit.py --name quiet_active_tcn                                   # pick 1
-    python3 scripts/submit.py --name quiet_active_tcn_rp --tcn-rest-pinch 3             # pick 2
+    python3 scripts/submit.py --name quiet_active_tcn_rp --tcn-rest-pinch 3             # 0.68375
+    python3 scripts/submit.py --name car_tcn_rp --tcn-rest-pinch 3 --car                # + CAR features
 
 The active branch averages the trees with temporal conv nets (TCNs) on the
 channel-relationship frames (aura/sequence.py), 3 by default; --tcn-seeds 0
@@ -9,6 +10,10 @@ gives the trees alone. Cross-validation, 3 repeats, gestures at 0.7 s: six-class
 macro F1 0.666 with the TCN vs 0.656 for the trees alone, better in every repeat.
 --tcn-rest-pinch N also averages N rest-vs-pinch TCNs with the trees in the quiet
 branch: 0.669 in cross-validation, but worse than without them in one of 3 repeats.
+--car also gives the common-average-reference features (data/features/car_*.pkl,
+scripts/build_car_features.py) to stage 1 and the rest-vs-pinch trees, not the
+active branch: full model 0.686 at 0.7 s and 0.680 at 0.9 s in cross-validation,
++0.017 and +0.020, better in every repeat (25 Nov 2026).
 
 Needs data/features/*.pkl (scripts/build_features.py) and, with TCNs,
 data/features/frames_relations_{train,test}.npz (scripts/build_frames.py
@@ -103,6 +108,8 @@ def main() -> None:
                     help="rest-vs-pinch TCNs averaged with the trees in the quiet branch; 0 = trees alone")
     ap.add_argument("--tcn-epochs", type=int, default=40)
     ap.add_argument("--device", default="auto", help="for the TCNs: auto (Apple GPU if available), mps, cuda or cpu")
+    ap.add_argument("--car", action="store_true",
+                    help="add the common-average-reference features to stage 1 and the rest-vs-pinch trees")
     ap.add_argument("--force", action="store_true", help="overwrite an existing submission in runs/<name>/")
     args = ap.parse_args()
 
@@ -114,10 +121,23 @@ def main() -> None:
     feat = ROOT / "data/features"
     train = pd.read_pickle(feat / "train.pkl")
     test = pd.read_pickle(feat / "test.pkl")
+    extra, extra_for = (), ()
+    if args.car:
+        ctr, cte = pd.read_pickle(feat / "car_train.pkl"), pd.read_pickle(feat / "car_test.pkl")
+        meta = ["session", "seg", "label", "kind", "offset", "n_rows"]
+        if len(ctr) != len(train) or not (ctr[meta].to_numpy() == train[meta].to_numpy()).all():
+            sys.exit("car_train.pkl does not match train.pkl; rerun scripts/build_car_features.py")
+        if len(cte) != len(test) or not (cte[["action_id", "n_rows"]].to_numpy() == test[["action_id", "n_rows"]].to_numpy()).all():
+            sys.exit("car_test.pkl does not match test.pkl; rerun scripts/build_car_features.py")
+        cols = [c for c in ctr.columns if c.startswith("C_")]
+        train = pd.concat([train, ctr[cols]], axis=1)
+        test = pd.concat([test, cte[cols]], axis=1)
+        extra, extra_for = ("C_",), ("quiet", "pinch")
+        print(f"added {len(cols)} common-average-reference features to stage 1 and rest vs pinch", flush=True)
 
     models, parts = [], []
     for seed in range(args.seeds):
-        m = TwoStage(seed=seed, gain_aug=not args.no_gain_aug).fit(train)
+        m = TwoStage(seed=seed, gain_aug=not args.no_gain_aug, extra=extra, extra_for=extra_for).fit(train)
         parts.append(m.predict_parts(test))
         models.append(m)
         print(f"model {seed + 1}/{args.seeds} trained ({time.time() - t0:.0f} s)", flush=True)
@@ -143,7 +163,7 @@ def main() -> None:
     if sub.gesture.isna().any() or len(sub) != len(sample):
         sys.exit("test actions do not match sample_submission.csv")
     sub.to_csv(out / "submission.csv", index=False)
-    test.drop(columns=[c for c in test.columns if c[:2] in ("A_", "B_", "S_")]).to_csv(out / "test_probabilities.csv", index=False)
+    test.drop(columns=[c for c in test.columns if c[:2] in ("A_", "B_", "S_", "C_")]).to_csv(out / "test_probabilities.csv", index=False)
     with open(out / "models.pkl", "wb") as f:
         pickle.dump(models, f)
     if tcn is not None or rp is not None:
@@ -159,6 +179,8 @@ def main() -> None:
         "git": git_state(),
         "settings": {"seeds": args.seeds, "design": "quiet/active", "gain_aug": not args.no_gain_aug,
                      "features": len(models[0].cols),
+                     "extra_features": None if not extra else {"prefixes": list(extra), "models": list(extra_for),
+                                                               "count": len(cols)},
                      "training_windows": len(train),
                      "active_tcn": None if tcn is None else {"seeds": args.tcn_seeds, "epochs": args.tcn_epochs,
                                                              "frames": "relations", "device": tcn["device"],
@@ -168,6 +190,8 @@ def main() -> None:
                                                                 "averaged_with_trees": True}},
         "sha256": {"submission.csv": sha256(out / "submission.csv"), "models.pkl": sha256(out / "models.pkl"),
                    "train_features": sha256(feat / "train.pkl"), "test_features": sha256(feat / "test.pkl"),
+                   **({} if not extra else {"car_train": sha256(feat / "car_train.pkl"),
+                                            "car_test": sha256(feat / "car_test.pkl")}),
                    **({} if tcn is None else {"tcn_active.pt": sha256(out / "tcn_active.pt")}),
                    **({} if rp is None else {"tcn_rest_pinch.pt": sha256(out / "tcn_rest_pinch.pt")}),
                    **({} if tcn is None and rp is None else
