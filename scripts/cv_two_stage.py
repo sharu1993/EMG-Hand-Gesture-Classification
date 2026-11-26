@@ -3,6 +3,7 @@
     python3 scripts/cv_two_stage.py                       # repeat (fold seed) 0
     python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active
     python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active_imu --imu --baseline quiet_active
+    python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active_aug60 --aug60 --baseline quiet_active
 
 Needs data/features/*.pkl (scripts/build_features.py). Prints, averaged over the
 repeats: stage 1 (quiet vs active), the rest-vs-pinch model on true rest and
@@ -13,7 +14,10 @@ metrics.json.
 
 --imu adds the per-axis IMU features (data/features/imu_*.pkl, from
 scripts/build_imu_features.py) to stage 1 and the active branch only; the
-rest-vs-pinch model is unchanged. --baseline NAME prints the change against
+rest-vs-pinch model is unchanged. --aug60 adds the simulated 60 Hz-like
+windows (data/features/aug60_train.pkl, from scripts/build_aug60.py) to the
+training data of all three models; in each fold it drops those whose window or
+noise comes from a held-out session. --baseline NAME prints the change against
 runs/NAME/metrics.json, repeat by repeat (same seeds and windows).
 """
 from __future__ import annotations
@@ -42,13 +46,17 @@ def macro_f1(y, p):
     return f1_score(y, p, labels=LABELS, average="macro", zero_division=0)
 
 
-def run_repeat(train, val, folds, seed, gain_aug, extra=()):
+def run_repeat(train, val, folds, seed, gain_aug, extra=(), aug=None):
     parts = {"p_quiet": np.full(len(val), np.nan), "p_pinch": np.full(len(val), np.nan),
              "p_active": np.full((len(val), len(ACTIVE)), np.nan)}
     for fo in folds:
         tr = ~train.session.isin(fo)
         va = val.session.isin(fo).to_numpy()
-        p = TwoStage(seed=seed, gain_aug=gain_aug, extra=extra).fit(train[tr]).predict_parts(val[va])
+        fit_on = train[tr]
+        if aug is not None:
+            keep = ~aug.session.isin(fo) & ~aug.noise_session.isin(fo)
+            fit_on = pd.concat([fit_on, aug.loc[keep, train.columns]], ignore_index=True)
+        p = TwoStage(seed=seed, gain_aug=gain_aug, extra=extra).fit(fit_on).predict_parts(val[va])
         for k in PARTS:
             parts[k][va] = p[k]
     return parts
@@ -86,6 +94,7 @@ def main() -> None:
     ap.add_argument("--no-gain-aug", action="store_true", help="train without the random-gain augmentation")
     ap.add_argument("--name", default="quiet_active")
     ap.add_argument("--imu", action="store_true", help="add the per-axis IMU features to stage 1 and the active branch")
+    ap.add_argument("--aug60", action="store_true", help="add the simulated 60 Hz-like training windows")
     ap.add_argument("--baseline", help="runs/<name> to compare with, repeat by repeat")
     args = ap.parse_args()
 
@@ -104,12 +113,22 @@ def main() -> None:
         val = pd.concat([val, pd.read_pickle(ROOT / "data/features/imu_val.pkl")[cols]], axis=1)
         extra = ("I_",)
         print(f"added {len(cols)} per-axis IMU features to stage 1 and the active branch", flush=True)
+    aug = None
+    if args.aug60:
+        if args.imu:
+            sys.exit("--aug60 with --imu is not supported (the simulated windows have no I_ features)")
+        aug = pd.read_pickle(ROOT / "data/features/aug60_train.pkl")
+        missing = [c for c in train.columns if c not in aug.columns]
+        if missing:
+            sys.exit(f"aug60_train.pkl lacks {len(missing)} columns of train.pkl; rerun scripts/build_aug60.py")
+        print(f"simulated 60 Hz-like windows: {len(aug)} (dropped per fold when their window or noise is held out)",
+              flush=True)
     cfg = read_folds(ROOT / "config/folds.json")
     out_dir = ROOT / "runs" / args.name
     out_dir.mkdir(parents=True, exist_ok=True)
     allm = {}
     for rep in args.repeats:
-        parts = run_repeat(train, val, cfg["repeats"][rep], seed=rep, gain_aug=not args.no_gain_aug, extra=extra)
+        parts = run_repeat(train, val, cfg["repeats"][rep], seed=rep, gain_aug=not args.no_gain_aug, extra=extra, aug=aug)
         oof = val[["session", "seg", "label", "kind", "offset"]].copy()
         oof["p_quiet"], oof["p_pinch"] = parts["p_quiet"], parts["p_pinch"]
         for j, g in enumerate(ACTIVE):
@@ -135,7 +154,8 @@ def main() -> None:
     print("confusion matrix (rows = true):")
     print(pd.DataFrame(confusion_matrix(y, pred, labels=LABELS), index=LABELS, columns=LABELS).to_string())
     (out_dir / "metrics.json").write_text(json.dumps({"repeats": {str(r): m for r, m in allm.items()},
-                                                      "gain_aug": not args.no_gain_aug, "extra": list(extra)}, indent=1))
+                                                      "gain_aug": not args.no_gain_aug, "extra": list(extra),
+                                                      "aug60": bool(args.aug60)}, indent=1))
     if args.baseline:
         base = json.loads((ROOT / "runs" / args.baseline / "metrics.json").read_text())["repeats"]
         keys = ["stage1_BA", "stage1_AUC", "active_F1", "F1", "F1_50Hz", "F1_60Hz", "pinch_F1"]
