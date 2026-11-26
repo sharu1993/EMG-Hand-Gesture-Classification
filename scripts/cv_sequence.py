@@ -4,6 +4,7 @@ on the fixed session folds, and score it in the chain against the trees.
     python3 scripts/cv_sequence.py --repeats 0 1 2 --frames relations                    # active gestures
     python3 scripts/cv_sequence.py --repeats 0 1 2 --frames relations --task rest_pinch
     python3 scripts/cv_sequence.py --repeats 0 1 2 --frames relations --task quiet
+    python3 scripts/cv_sequence.py --repeats 0 1 2 --frames relations_car --task rest_pinch --seeds 3
 
 Tasks (each trained the same way as the matching tree model in aura/twostage.py):
   active      fist / open / point / thumb-up, on active windows            -> p_active
@@ -74,7 +75,7 @@ def main() -> None:
     ap.add_argument("--task", choices=list(PART), default="active")
     ap.add_argument("--repeats", type=int, nargs="+", default=[0])
     ap.add_argument("--trees", default="quiet_active", help="runs/<name> holding the tree model's out-of-fold files")
-    ap.add_argument("--frames", choices=["power", "relations"], default="power")
+    ap.add_argument("--frames", choices=["power", "relations", "relations_car"], default="power")
     ap.add_argument("--name", default=None, help="default tcn_<task>_<frames> (tcn_active for active/power)")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--seeds", type=int, default=1, help="TCNs per fold, probabilities averaged")

@@ -3,11 +3,12 @@ training, validation and test window.
 
     python3 scripts/build_frames.py                      # power frames
     python3 scripts/build_frames.py --kind relations     # frames with channel relationships
+    python3 scripts/build_frames.py --kind relations_car # the same on the common-average-referenced EMG
 
 Windows are drawn exactly as in scripts/build_features.py (same seed and
 order), and the script checks that the rows line up with data/features/*.pkl.
 Writes data/features/frames_{train,val,test}.npz for power frames and
-data/features/frames_relations_{train,val,test}.npz for relation frames (git-ignored).
+data/features/frames_<kind>_{train,val,test}.npz for the other kinds (git-ignored).
 """
 from __future__ import annotations
 

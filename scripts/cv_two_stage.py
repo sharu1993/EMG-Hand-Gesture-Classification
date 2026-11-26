@@ -5,6 +5,7 @@
     python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active_imu --imu --baseline quiet_active
     python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active_aug60 --aug60 --baseline quiet_active
     python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active_car --car --baseline quiet_active
+    python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active_td --td --baseline quiet_active
 
 Needs data/features/*.pkl (scripts/build_features.py). Prints, averaged over the
 repeats: stage 1 (quiet vs active), the rest-vs-pinch model on true rest and
@@ -20,7 +21,8 @@ windows (data/features/aug60_train.pkl, from scripts/build_aug60.py) to the
 training data of all three models; in each fold it drops those whose window or
 noise comes from a held-out session. --car adds the common-average-reference
 features (data/features/car_*.pkl, from scripts/build_car_features.py) to all
-three models. --baseline NAME prints the change against
+three models; --td the time-domain features (data/features/td_*.pkl, from
+scripts/build_td_features.py) to all three. --baseline NAME prints the change against
 runs/NAME/metrics.json, repeat by repeat (same seeds and windows).
 """
 from __future__ import annotations
@@ -99,6 +101,7 @@ def main() -> None:
     ap.add_argument("--imu", action="store_true", help="add the per-axis IMU features to stage 1 and the active branch")
     ap.add_argument("--aug60", action="store_true", help="add the simulated 60 Hz-like training windows")
     ap.add_argument("--car", action="store_true", help="add the common-average-reference features to all three models")
+    ap.add_argument("--td", action="store_true", help="add the time-domain features to all three models")
     ap.add_argument("--baseline", help="runs/<name> to compare with, repeat by repeat")
     args = ap.parse_args()
 
@@ -106,13 +109,15 @@ def main() -> None:
     train = pd.read_pickle(ROOT / "data/features/train.pkl")
     val = pd.read_pickle(ROOT / "data/features/val.pkl")
     extra, extra_for = (), ("quiet", "active")
-    if args.imu and args.car:
-        sys.exit("use one of --imu and --car")
+    if args.imu + args.car + args.td > 1:
+        sys.exit("use one of --imu, --car and --td")
     for flag, file, prefix, models, script, what in (
             (args.imu, "imu", "I_", ("quiet", "active"), "build_imu_features.py",
              "per-axis IMU features to stage 1 and the active branch"),
             (args.car, "car", "C_", ("quiet", "pinch", "active"), "build_car_features.py",
-             "common-average-reference features to all three models")):
+             "common-average-reference features to all three models"),
+            (args.td, "td", "T_", ("quiet", "pinch", "active"), "build_td_features.py",
+             "time-domain features to all three models")):
         if not flag:
             continue
         meta = ["session", "seg", "label", "kind", "offset", "n_rows"]
@@ -128,8 +133,8 @@ def main() -> None:
         print(f"added {len(cols)} {what}", flush=True)
     aug = None
     if args.aug60:
-        if args.imu or args.car:
-            sys.exit("--aug60 cannot be combined with --imu or --car (the simulated windows have only A, B, S features)")
+        if args.imu or args.car or args.td:
+            sys.exit("--aug60 cannot be combined with --imu, --car or --td (the simulated windows have only A, B, S features)")
         aug = pd.read_pickle(ROOT / "data/features/aug60_train.pkl")
         missing = [c for c in train.columns if c not in aug.columns]
         if missing:

@@ -10,6 +10,7 @@ Stage 2, which gesture (overall amplitude removed first):
   log (28 off-diagonal); plus the IMU features.
 Optional set I (imu_axis_features): direction of the movement per IMU axis.
 Optional set C (car_features): the EMG after common-average reference.
+Optional set T (td_features): time-domain shape of the EMG per channel.
 
 All features are means, ratios or positions, never sums or counts, so the
 window's row count cannot carry the class.
@@ -138,6 +139,39 @@ def car_features(emg: np.ndarray, imu: np.ndarray, fresh: np.ndarray) -> dict:
         for j, (i0, i1) in enumerate(zip(*_IU7)):
             f[f"C_shape_{bn}_{i0 + 1}_{i1 + 1}"] = v[j]
         f[f"C_scale_{bn}"] = scale
+    return f
+
+
+# ------------------------------------------------------------------ time domain (optional set T)
+
+TD_THRESH = 0.02      # zero-crossing / slope-change threshold, as a fraction of the channel's RMS
+
+
+def td_features(emg: np.ndarray, imu: np.ndarray, fresh: np.ndarray) -> dict:
+    """Classic time-domain EMG features of the cleaned signal, prefix T_; 45.
+
+    Per channel, all scale-free (the absolute level is in set A): waveform length
+    over RMS, zero-crossing rate, slope-sign-change rate (both with a threshold of
+    TD_THRESH x RMS, so noise around zero does not count), Hjorth mobility (a mean
+    frequency) and complexity (its spread); and their means over channels. Rates
+    are per sample, so the window's length does not enter. imu and fresh are unused."""
+    y = clean_emg(emg)
+    rms = np.sqrt((y ** 2).mean(0)) + EPS
+    d = np.diff(y, axis=0)
+    dd = np.diff(d, axis=0)
+    thr = TD_THRESH * rms
+    wl = np.abs(d).mean(0) / rms
+    zc = ((y[:-1] * y[1:] < 0) & (np.abs(d) >= thr)).mean(0)
+    d1, d2 = y[1:-1] - y[:-2], y[1:-1] - y[2:]
+    ssc = ((d1 * d2 > 0) & ((np.abs(d1) >= thr) | (np.abs(d2) >= thr))).mean(0)
+    sx, sd, sdd = y.std(0) + EPS, d.std(0) + EPS, dd.std(0) + EPS
+    mob = sd / sx
+    comp = (sdd / sd) / mob
+    f = {}
+    for name, v in (("wl", wl), ("zc", zc), ("ssc", ssc), ("mob", mob), ("comp", comp)):
+        for c in range(8):
+            f[f"T_{name}_ch{c + 1}"] = float(v[c])
+        f[f"T_{name}_mean"] = float(v.mean())
     return f
 
 

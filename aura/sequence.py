@@ -8,8 +8,9 @@ gain-normalised EMG, so a 1.4 s window gives about 25 frames. Per frame:
   mean of each IMU axis over the frame's fresh rows (6).
 The TCN reads the frames in order, then pools over time (mean and max).
 
-Two frame kinds: "power" (above) and "relations" (below: longer frames that
-add each frame's channel covariance shape and correlation).
+Three frame kinds: "power" (above), "relations" (below: longer frames that
+add each frame's channel covariance shape and correlation) and "relations_car"
+(the same frames on the common-average-referenced signal).
 """
 from __future__ import annotations
 
@@ -99,7 +100,73 @@ def relation_frame_features(emg: np.ndarray, imu: np.ndarray, fresh: np.ndarray)
     return out
 
 
-FRAME_KINDS = {"power": frame_features, "relations": relation_frame_features}
+# ------------------------------------------------ relation frames, common-average reference
+# As the relation frames, on the EMG after common-average reference (each channel
+# minus the mean of all 8, sample by sample; aura.features.car_features). The
+# referenced channels sum to zero, so covariance is taken over the 7 independent
+# directions (Helmert basis), and the correlation matrix (singular) is replaced by
+# the share of each band's power that is common to all channels. Per frame:
+#   log power per referenced channel in the three bands (24, first, for _augment);
+#   covariance shape (28) and scale (1), whole band, 7 directions;
+#   covariance shape in 20-45 Hz (28), 7 directions;
+#   common share per band, of the signal before referencing (3);
+#   IMU mean over the frame's fresh rows (6).
+_IU7 = np.triu_indices(7)
+_OFFW7 = np.where(_IU7[0] == _IU7[1], 1.0, np.sqrt(2.0))
+N_REL_CAR = N_EMG + 29 + 28 + len(BANDS) + 6
+
+
+def _helmert(n: int = 8) -> np.ndarray:
+    h = np.zeros((n - 1, n))
+    for k in range(1, n):
+        h[k - 1, :k] = 1.0
+        h[k - 1, k] = -k
+        h[k - 1] /= np.sqrt(k * (k + 1))
+    return h
+
+
+_H = _helmert()
+
+
+def _shape_scale7(z):
+    w = z @ _H.T
+    c = w.T @ w / len(w)
+    c = c + 1e-6 * np.trace(c) / 7 * np.eye(7)
+    t = _logm(c)
+    sc = np.trace(t) / 7
+    return (t - sc * np.eye(7))[_IU7] * _OFFW7, sc
+
+
+def relation_car_frame_features(emg: np.ndarray, imu: np.ndarray, fresh: np.ndarray) -> np.ndarray:
+    """(n_frames, N_REL_CAR) float32 for one window (mean-centred rows, 250 Hz)."""
+    y = clean_emg(emg)
+    yc = y - y.mean(1, keepdims=True)
+    g = np.sqrt((yc ** 2).mean()) + EPS
+    y, yc = y / g, yc / g
+    bands = [band(y, *b) for b in BANDS]
+    bands_c = [z - z.mean(1, keepdims=True) for z in bands]
+    n = len(y)
+    starts = list(range(0, max(1, n - REL_FRAME + 1), REL_HOP))[:MAX_FRAMES]
+    out = np.empty((len(starts), N_REL_CAR), np.float32)
+    for i, a in enumerate(starts):
+        seg = slice(a, min(n, a + REL_FRAME))
+        out[i, :N_EMG] = np.log(np.stack([(z[seg] ** 2).mean(0) for z in bands_c]).reshape(-1) + EPS)
+        sh, sc = _shape_scale7(yc[seg])
+        sh_low, _ = _shape_scale7(bands_c[0][seg])
+        j = N_EMG
+        out[i, j:j + 28] = sh; j += 28
+        out[i, j] = sc; j += 1
+        out[i, j:j + 28] = sh_low; j += 28
+        for z in bands:
+            zs = z[seg]
+            out[i, j] = (zs.mean(1) ** 2).mean() / ((zs ** 2).mean() + EPS); j += 1
+        f = fresh[seg]
+        out[i, j:] = (imu[seg][f] if f.sum() >= 1 else imu[seg]).mean(0)
+    return out
+
+
+FRAME_KINDS = {"power": frame_features, "relations": relation_frame_features,
+               "relations_car": relation_car_frame_features}
 
 
 def pad(frames: list[np.ndarray]):
