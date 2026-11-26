@@ -4,6 +4,7 @@
     python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active
     python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active_imu --imu --baseline quiet_active
     python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active_aug60 --aug60 --baseline quiet_active
+    python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active_car --car --baseline quiet_active
 
 Needs data/features/*.pkl (scripts/build_features.py). Prints, averaged over the
 repeats: stage 1 (quiet vs active), the rest-vs-pinch model on true rest and
@@ -17,7 +18,9 @@ scripts/build_imu_features.py) to stage 1 and the active branch only; the
 rest-vs-pinch model is unchanged. --aug60 adds the simulated 60 Hz-like
 windows (data/features/aug60_train.pkl, from scripts/build_aug60.py) to the
 training data of all three models; in each fold it drops those whose window or
-noise comes from a held-out session. --baseline NAME prints the change against
+noise comes from a held-out session. --car adds the common-average-reference
+features (data/features/car_*.pkl, from scripts/build_car_features.py) to all
+three models. --baseline NAME prints the change against
 runs/NAME/metrics.json, repeat by repeat (same seeds and windows).
 """
 from __future__ import annotations
@@ -46,7 +49,7 @@ def macro_f1(y, p):
     return f1_score(y, p, labels=LABELS, average="macro", zero_division=0)
 
 
-def run_repeat(train, val, folds, seed, gain_aug, extra=(), aug=None):
+def run_repeat(train, val, folds, seed, gain_aug, extra=(), aug=None, extra_for=("quiet", "active")):
     parts = {"p_quiet": np.full(len(val), np.nan), "p_pinch": np.full(len(val), np.nan),
              "p_active": np.full((len(val), len(ACTIVE)), np.nan)}
     for fo in folds:
@@ -56,7 +59,7 @@ def run_repeat(train, val, folds, seed, gain_aug, extra=(), aug=None):
         if aug is not None:
             keep = ~aug.session.isin(fo) & ~aug.noise_session.isin(fo)
             fit_on = pd.concat([fit_on, aug.loc[keep, train.columns]], ignore_index=True)
-        p = TwoStage(seed=seed, gain_aug=gain_aug, extra=extra).fit(fit_on).predict_parts(val[va])
+        p = TwoStage(seed=seed, gain_aug=gain_aug, extra=extra, extra_for=extra_for).fit(fit_on).predict_parts(val[va])
         for k in PARTS:
             parts[k][va] = p[k]
     return parts
@@ -95,28 +98,38 @@ def main() -> None:
     ap.add_argument("--name", default="quiet_active")
     ap.add_argument("--imu", action="store_true", help="add the per-axis IMU features to stage 1 and the active branch")
     ap.add_argument("--aug60", action="store_true", help="add the simulated 60 Hz-like training windows")
+    ap.add_argument("--car", action="store_true", help="add the common-average-reference features to all three models")
     ap.add_argument("--baseline", help="runs/<name> to compare with, repeat by repeat")
     args = ap.parse_args()
 
     t0 = time.time()
     train = pd.read_pickle(ROOT / "data/features/train.pkl")
     val = pd.read_pickle(ROOT / "data/features/val.pkl")
-    extra = ()
-    if args.imu:
+    extra, extra_for = (), ("quiet", "active")
+    if args.imu and args.car:
+        sys.exit("use one of --imu and --car")
+    for flag, file, prefix, models, script, what in (
+            (args.imu, "imu", "I_", ("quiet", "active"), "build_imu_features.py",
+             "per-axis IMU features to stage 1 and the active branch"),
+            (args.car, "car", "C_", ("quiet", "pinch", "active"), "build_car_features.py",
+             "common-average-reference features to all three models")):
+        if not flag:
+            continue
         meta = ["session", "seg", "label", "kind", "offset", "n_rows"]
+        add = {}
         for name, df in (("train", train), ("val", val)):
-            imu = pd.read_pickle(ROOT / f"data/features/imu_{name}.pkl")
-            if len(imu) != len(df) or not (imu[meta].to_numpy() == df[meta].to_numpy()).all():
-                sys.exit(f"imu_{name}.pkl does not match {name}.pkl; rerun scripts/build_imu_features.py")
-        cols = [c for c in imu.columns if c.startswith("I_")]
-        train = pd.concat([train, pd.read_pickle(ROOT / "data/features/imu_train.pkl")[cols]], axis=1)
-        val = pd.concat([val, pd.read_pickle(ROOT / "data/features/imu_val.pkl")[cols]], axis=1)
-        extra = ("I_",)
-        print(f"added {len(cols)} per-axis IMU features to stage 1 and the active branch", flush=True)
+            add[name] = pd.read_pickle(ROOT / f"data/features/{file}_{name}.pkl")
+            if len(add[name]) != len(df) or not (add[name][meta].to_numpy() == df[meta].to_numpy()).all():
+                sys.exit(f"{file}_{name}.pkl does not match {name}.pkl; rerun scripts/{script}")
+        cols = [c for c in add["train"].columns if c.startswith(prefix)]
+        train = pd.concat([train, add["train"][cols]], axis=1)
+        val = pd.concat([val, add["val"][cols]], axis=1)
+        extra, extra_for = (prefix,), models
+        print(f"added {len(cols)} {what}", flush=True)
     aug = None
     if args.aug60:
-        if args.imu:
-            sys.exit("--aug60 with --imu is not supported (the simulated windows have no I_ features)")
+        if args.imu or args.car:
+            sys.exit("--aug60 cannot be combined with --imu or --car (the simulated windows have only A, B, S features)")
         aug = pd.read_pickle(ROOT / "data/features/aug60_train.pkl")
         missing = [c for c in train.columns if c not in aug.columns]
         if missing:
@@ -128,7 +141,8 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     allm = {}
     for rep in args.repeats:
-        parts = run_repeat(train, val, cfg["repeats"][rep], seed=rep, gain_aug=not args.no_gain_aug, extra=extra, aug=aug)
+        parts = run_repeat(train, val, cfg["repeats"][rep], seed=rep, gain_aug=not args.no_gain_aug, extra=extra, aug=aug,
+                           extra_for=extra_for)
         oof = val[["session", "seg", "label", "kind", "offset"]].copy()
         oof["p_quiet"], oof["p_pinch"] = parts["p_quiet"], parts["p_pinch"]
         for j, g in enumerate(ACTIVE):
@@ -155,7 +169,7 @@ def main() -> None:
     print(pd.DataFrame(confusion_matrix(y, pred, labels=LABELS), index=LABELS, columns=LABELS).to_string())
     (out_dir / "metrics.json").write_text(json.dumps({"repeats": {str(r): m for r, m in allm.items()},
                                                       "gain_aug": not args.no_gain_aug, "extra": list(extra),
-                                                      "aug60": bool(args.aug60)}, indent=1))
+                                                      "aug60": bool(args.aug60), "extra_for": list(extra_for) if extra else []}, indent=1))
     if args.baseline:
         base = json.loads((ROOT / "runs" / args.baseline / "metrics.json").read_text())["repeats"]
         keys = ["stage1_BA", "stage1_AUC", "active_F1", "F1", "F1_50Hz", "F1_60Hz", "pinch_F1"]

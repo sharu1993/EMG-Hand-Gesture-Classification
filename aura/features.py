@@ -9,6 +9,7 @@ Stage 2, which gesture (overall amplitude removed first):
   (overall power divided out, 36) and scale (1); the correlation matrix's
   log (28 off-diagonal); plus the IMU features.
 Optional set I (imu_axis_features): direction of the movement per IMU axis.
+Optional set C (car_features): the EMG after common-average reference.
 
 All features are means, ratios or positions, never sums or counts, so the
 window's row count cannot carry the class.
@@ -83,6 +84,60 @@ def imu_axis_features(imu: np.ndarray, fresh: np.ndarray) -> dict:
     w, v = np.linalg.eigh(c + EPS * np.eye(3))
     for j, a in enumerate(_AX):
         f[f"I_gyro_dir_{a}"] = abs(v[j, -1])                                     # main rotation axis, sign-free
+    return f
+
+
+# ------------------------------------------------------------------ common-average reference (optional set C)
+
+def _helmert(n: int = 8) -> np.ndarray:
+    """(n-1, n) orthonormal rows, each orthogonal to the all-ones vector."""
+    h = np.zeros((n - 1, n))
+    for k in range(1, n):
+        h[k - 1, :k] = 1.0
+        h[k - 1, k] = -k
+        h[k - 1] /= np.sqrt(k * (k + 1))
+    return h
+
+
+_H = _helmert()
+_IU7 = np.triu_indices(7)
+_DIAG7 = np.flatnonzero(_IU7[0] == _IU7[1])
+
+
+def car_features(emg: np.ndarray, imu: np.ndarray, fresh: np.ndarray) -> dict:
+    """The EMG after common-average reference (each channel minus the mean of
+    all 8, sample by sample), prefix C_; 117 features.
+
+    Per band: log power of each referenced channel and their mean (9); the share
+    of the band's power that is common to all channels (1; 1/8 if the channels
+    are independent, 1 if identical); and the covariance of the referenced
+    signal, gain-normalised, in log-Euclidean tangent space split into shape (28)
+    and scale (1). The referenced channels sum to zero, so the covariance is
+    taken over the 7 independent directions (Helmert basis), which keeps it
+    full rank. imu and fresh are unused (same signature as the other sets)."""
+    y = clean_emg(emg)
+    yc = y - y.mean(1, keepdims=True)
+    g = np.sqrt((yc ** 2).mean()) + EPS
+    f = {}
+    for b in BANDS:
+        bn = _bname(*b)
+        z = band(y, *b)
+        zc = z - z.mean(1, keepdims=True)
+        p = np.log((zc ** 2).mean(0) + EPS)
+        for c in range(8):
+            f[f"C_logp_{bn}_ch{c + 1}"] = p[c]
+        f[f"C_logp_{bn}_mean"] = np.log((zc ** 2).mean() + EPS)
+        f[f"C_common_{bn}"] = (z.mean(1) ** 2).mean() / ((z ** 2).mean() + EPS)
+        w = (zc / g) @ _H.T                                   # (n, 7)
+        c7 = w.T @ w / len(w)
+        c7 = c7 + 1e-6 * np.trace(c7) / 7 * np.eye(7)
+        t = _logm_spd(c7)
+        scale = np.trace(t) / 7
+        v = (t - scale * np.eye(7))[_IU7]
+        v[np.setdiff1d(np.arange(len(v)), _DIAG7)] *= np.sqrt(2)
+        for j, (i0, i1) in enumerate(zip(*_IU7)):
+            f[f"C_shape_{bn}_{i0 + 1}_{i1 + 1}"] = v[j]
+        f[f"C_scale_{bn}"] = scale
     return f
 
 
