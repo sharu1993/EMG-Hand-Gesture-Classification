@@ -50,38 +50,50 @@ def gain_augment(X: np.ndarray, cols: list[str], rng: np.random.Generator) -> np
 
 
 class TwoStage:
-    def __init__(self, seed: int = 0, gain_aug: bool = True):
-        self.seed, self.gain_aug = seed, gain_aug
+    """extra: further feature prefixes (e.g. ("I_",)), given only to the models
+    named in extra_for ("quiet" = stage 1, "pinch" = rest vs pinch, "active")."""
 
-    def _x(self, df: pd.DataFrame, aug_seed: int | None = None) -> np.ndarray:
-        X = df[self.cols].to_numpy(float)
+    def __init__(self, seed: int = 0, gain_aug: bool = True, extra: tuple = (), extra_for: tuple = ("quiet", "active")):
+        self.seed, self.gain_aug = seed, gain_aug
+        self.extra, self.extra_for = tuple(extra), tuple(extra_for)
+
+    def _cols(self, model: str) -> list[str]:
+        cm = getattr(self, "cols_m", None)            # models saved before per-model columns use self.cols
+        return cm[model] if cm else self.cols
+
+    def _x(self, df: pd.DataFrame, model: str, aug_seed: int | None = None) -> np.ndarray:
+        cols = self._cols(model)
+        X = df[cols].to_numpy(float)
         if aug_seed is not None and self.gain_aug:
-            X = gain_augment(X, self.cols, np.random.default_rng(aug_seed))
+            X = gain_augment(X, cols, np.random.default_rng(aug_seed))
         return X
 
     def fit(self, train: pd.DataFrame) -> "TwoStage":
         self.cols = feature_cols(train)
+        more = feature_cols(train, self.extra) if self.extra else []
+        if self.extra and not more:
+            raise ValueError(f"no columns with prefixes {self.extra}")
+        self.cols_m = {m: self.cols + (more if m in self.extra_for else []) for m in ("quiet", "pinch", "active")}
         lab = train["label"].to_numpy()
         s = self.seed
         # stage 1: quiet vs active, all windows
-        self.m_quiet = _trees(s).fit(self._x(train, s), np.isin(lab, QUIET).astype(int))
+        self.m_quiet = _trees(s).fit(self._x(train, "quiet", s), np.isin(lab, QUIET).astype(int))
         # quiet branch: rest vs pinch on equal numbers of each
         ip = np.flatnonzero(lab == "pinch")
         ir = np.random.default_rng(s + 1).choice(np.flatnonzero(lab == "rest"), size=len(ip), replace=False)
         q = train.iloc[np.r_[ip, ir]]
-        self.m_pinch = _trees(s).fit(self._x(q, s + 2), (q["label"] == "pinch").to_numpy().astype(int))
+        self.m_pinch = _trees(s).fit(self._x(q, "pinch", s + 2), (q["label"] == "pinch").to_numpy().astype(int))
         # active branch: four gestures
         a = train[np.isin(lab, ACTIVE)]
-        self.m_active = _trees(s).fit(self._x(a), a["label"].to_numpy())
+        self.m_active = _trees(s).fit(self._x(a, "active"), a["label"].to_numpy())
         self.order_active = [list(self.m_active.classes_).index(c) for c in ACTIVE]
         return self
 
     def predict_parts(self, df: pd.DataFrame) -> dict:
         """p_quiet (n,), p_pinch = p(pinch | quiet) (n,), p_active (n, 4) in ACTIVE order."""
-        X = self._x(df)
-        return {"p_quiet": self.m_quiet.predict_proba(X)[:, 1],
-                "p_pinch": self.m_pinch.predict_proba(X)[:, 1],
-                "p_active": self.m_active.predict_proba(X)[:, self.order_active]}
+        return {"p_quiet": self.m_quiet.predict_proba(self._x(df, "quiet"))[:, 1],
+                "p_pinch": self.m_pinch.predict_proba(self._x(df, "pinch"))[:, 1],
+                "p_active": self.m_active.predict_proba(self._x(df, "active"))[:, self.order_active]}
 
 
 def average_parts(parts: list[dict]) -> dict:

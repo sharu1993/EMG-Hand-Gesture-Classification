@@ -8,6 +8,7 @@ Stage 2, which gesture (overall amplitude removed first):
   per band, the 8x8 covariance in log-Euclidean tangent space split into shape
   (overall power divided out, 36) and scale (1); the correlation matrix's
   log (28 off-diagonal); plus the IMU features.
+Optional set I (imu_axis_features): direction of the movement per IMU axis.
 
 All features are means, ratios or positions, never sums or counts, so the
 window's row count cannot carry the class.
@@ -46,6 +47,43 @@ def imu_features(imu: np.ndarray, fresh: np.ndarray) -> dict:
             "imu_gyro_argmax": np.argmax(gm) / max(1, n - 1),
             "imu_gyro_early_minus_late": gm[:k].mean() - gm[k:].mean() if n > k else 0.0,
             "imu_acc_mean": am.mean(), "imu_acc_std": am.std()}
+
+
+# ------------------------------------------------------------------ IMU per axis (optional set I)
+
+_AX = ("x", "y", "z")
+
+
+def imu_axis_features(imu: np.ndarray, fresh: np.ndarray) -> dict:
+    """Direction of the movement, per axis (prefix I_; 21 features).
+
+    The window is mean-centred as in the test files, so absolute orientation is
+    gone, but the change in orientation and the axis of rotation within the
+    window are kept. The first 30% of the window (about 0.4 s) is compared with
+    the rest, as in imu_features."""
+    x = fresh_imu(imu, fresh)
+    x = x - x.mean(0)
+    acc, gyr = x[:, 0:3], x[:, 3:6]
+    n = len(x)
+    k = max(1, int(round(0.3 * n)))
+    f = {}
+    gs, as_ = gyr.std(0), acc.std(0)
+    gv = gs ** 2
+    for j, a in enumerate(_AX):
+        f[f"I_gyro_rms_{a}"] = gs[j]
+        f[f"I_gyro_share_{a}"] = gv[j] / (gv.sum() + EPS)                       # scale-free
+        f[f"I_acc_rms_{a}"] = as_[j]
+        late = slice(k, None) if n > k else slice(None)
+        f[f"I_acc_shift_{a}"] = acc[late, j].mean() - acc[:k, j].mean()         # orientation change, signed
+        f[f"I_gyro_early_{a}"] = gyr[:k, j].mean() - gyr[late, j].mean()        # early rotation, signed
+    c = np.cov(gyr.T) if n > 2 else np.zeros((3, 3))
+    d = np.sqrt(np.maximum(np.diag(c), EPS))
+    for i0, i1 in ((0, 1), (0, 2), (1, 2)):
+        f[f"I_gyro_corr_{_AX[i0]}{_AX[i1]}"] = c[i0, i1] / (d[i0] * d[i1]) if gv[i0] > EPS and gv[i1] > EPS else 0.0
+    w, v = np.linalg.eigh(c + EPS * np.eye(3))
+    for j, a in enumerate(_AX):
+        f[f"I_gyro_dir_{a}"] = abs(v[j, -1])                                     # main rotation axis, sign-free
+    return f
 
 
 # ------------------------------------------------------------------ stage 1

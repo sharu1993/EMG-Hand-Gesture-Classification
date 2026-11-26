@@ -2,6 +2,7 @@
 
     python3 scripts/cv_two_stage.py                       # repeat (fold seed) 0
     python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active
+    python3 scripts/cv_two_stage.py --repeats 0 1 2 --name quiet_active_imu --imu --baseline quiet_active
 
 Needs data/features/*.pkl (scripts/build_features.py). Prints, averaged over the
 repeats: stage 1 (quiet vs active), the rest-vs-pinch model on true rest and
@@ -9,6 +10,11 @@ pinch windows, the active model on true active windows, and the chained
 six-class macro F1 (the competition metric) by validation set, setup (50/60 Hz)
 and session. Writes runs/<name>/ with the out-of-fold probabilities and a
 metrics.json.
+
+--imu adds the per-axis IMU features (data/features/imu_*.pkl, from
+scripts/build_imu_features.py) to stage 1 and the active branch only; the
+rest-vs-pinch model is unchanged. --baseline NAME prints the change against
+runs/NAME/metrics.json, repeat by repeat (same seeds and windows).
 """
 from __future__ import annotations
 
@@ -36,13 +42,13 @@ def macro_f1(y, p):
     return f1_score(y, p, labels=LABELS, average="macro", zero_division=0)
 
 
-def run_repeat(train, val, folds, seed, gain_aug):
+def run_repeat(train, val, folds, seed, gain_aug, extra=()):
     parts = {"p_quiet": np.full(len(val), np.nan), "p_pinch": np.full(len(val), np.nan),
              "p_active": np.full((len(val), len(ACTIVE)), np.nan)}
     for fo in folds:
         tr = ~train.session.isin(fo)
         va = val.session.isin(fo).to_numpy()
-        p = TwoStage(seed=seed, gain_aug=gain_aug).fit(train[tr]).predict_parts(val[va])
+        p = TwoStage(seed=seed, gain_aug=gain_aug, extra=extra).fit(train[tr]).predict_parts(val[va])
         for k in PARTS:
             parts[k][va] = p[k]
     return parts
@@ -79,17 +85,31 @@ def main() -> None:
     ap.add_argument("--repeats", type=int, nargs="+", default=[0])
     ap.add_argument("--no-gain-aug", action="store_true", help="train without the random-gain augmentation")
     ap.add_argument("--name", default="quiet_active")
+    ap.add_argument("--imu", action="store_true", help="add the per-axis IMU features to stage 1 and the active branch")
+    ap.add_argument("--baseline", help="runs/<name> to compare with, repeat by repeat")
     args = ap.parse_args()
 
     t0 = time.time()
     train = pd.read_pickle(ROOT / "data/features/train.pkl")
     val = pd.read_pickle(ROOT / "data/features/val.pkl")
+    extra = ()
+    if args.imu:
+        meta = ["session", "seg", "label", "kind", "offset", "n_rows"]
+        for name, df in (("train", train), ("val", val)):
+            imu = pd.read_pickle(ROOT / f"data/features/imu_{name}.pkl")
+            if len(imu) != len(df) or not (imu[meta].to_numpy() == df[meta].to_numpy()).all():
+                sys.exit(f"imu_{name}.pkl does not match {name}.pkl; rerun scripts/build_imu_features.py")
+        cols = [c for c in imu.columns if c.startswith("I_")]
+        train = pd.concat([train, pd.read_pickle(ROOT / "data/features/imu_train.pkl")[cols]], axis=1)
+        val = pd.concat([val, pd.read_pickle(ROOT / "data/features/imu_val.pkl")[cols]], axis=1)
+        extra = ("I_",)
+        print(f"added {len(cols)} per-axis IMU features to stage 1 and the active branch", flush=True)
     cfg = read_folds(ROOT / "config/folds.json")
     out_dir = ROOT / "runs" / args.name
     out_dir.mkdir(parents=True, exist_ok=True)
     allm = {}
     for rep in args.repeats:
-        parts = run_repeat(train, val, cfg["repeats"][rep], seed=rep, gain_aug=not args.no_gain_aug)
+        parts = run_repeat(train, val, cfg["repeats"][rep], seed=rep, gain_aug=not args.no_gain_aug, extra=extra)
         oof = val[["session", "seg", "label", "kind", "offset"]].copy()
         oof["p_quiet"], oof["p_pinch"] = parts["p_quiet"], parts["p_pinch"]
         for j, g in enumerate(ACTIVE):
@@ -115,7 +135,17 @@ def main() -> None:
     print("confusion matrix (rows = true):")
     print(pd.DataFrame(confusion_matrix(y, pred, labels=LABELS), index=LABELS, columns=LABELS).to_string())
     (out_dir / "metrics.json").write_text(json.dumps({"repeats": {str(r): m for r, m in allm.items()},
-                                                      "gain_aug": not args.no_gain_aug}, indent=1))
+                                                      "gain_aug": not args.no_gain_aug, "extra": list(extra)}, indent=1))
+    if args.baseline:
+        base = json.loads((ROOT / "runs" / args.baseline / "metrics.json").read_text())["repeats"]
+        keys = ["stage1_BA", "stage1_AUC", "active_F1", "F1", "F1_50Hz", "F1_60Hz", "pinch_F1"]
+        print(f"\nchange vs runs/{args.baseline}, per repeat (this run minus baseline):")
+        for kind in ("val", "val_late"):
+            d = pd.DataFrame({k: [allm[r][kind][k] - base[str(r)][kind][k] for r in allm if str(r) in base] for k in keys},
+                             index=[f"repeat {r}" for r in allm if str(r) in base])
+            d.loc["mean"] = d.mean()
+            print(f"gestures at {'0.7' if kind == 'val' else '0.9'} s:")
+            print(d.round(3).to_string())
     print(f"\nsaved {out_dir} ({time.time() - t0:.0f} s)")
 
 
